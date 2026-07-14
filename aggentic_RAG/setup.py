@@ -1,20 +1,21 @@
-from setuptools import setup, find_packages
+from pathlib import Path
+
+from setuptools import find_packages, setup
+
+
+def load_requirements():
+    requirements_path = Path(__file__).with_name("requirements.txt")
+    requirements = []
+    for line in requirements_path.read_text(encoding="utf-8").splitlines():
+        requirement = line.split("#", 1)[0].strip()
+        if requirement:
+            requirements.append(requirement)
+    return requirements
 
 setup(
     name="travel_agent",
     version="0.1.0",
     packages=find_packages(),
-    install_requires=[
-        "langchain>=0.3.0",
-        "langgraph>=0.2.0",
-        "langchain-openai>=0.2.0",
-        "langchain-community>=0.3.0",
-        "langchain-chroma>=0.1.0",
-        "dashscope>=1.20.0",
-        "chromadb>=0.5.0",
-        "python-dotenv>=1.0.0",
-        "openai-agents>=0.1.0",
-        "mcp>=0.1.0",
-    ],
+    install_requires=load_requirements(),
     python_requires=">=3.11",
 )

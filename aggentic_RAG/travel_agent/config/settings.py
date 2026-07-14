@@ -35,7 +35,11 @@ R1_TEMPERATURE = 0.1
 EMBEDDING_MODEL = "text-embedding-v4"
 
 # RAG配置
-CHROMA_PERSIST_DIR = PROJECT_ROOT / "data" / "travel_vectordb"
+_chroma_path_env = os.getenv("CHROMA_PERSIST_DIR", "data/travel_vectordb")
+if Path(_chroma_path_env).is_absolute():
+    CHROMA_PERSIST_DIR = Path(_chroma_path_env)
+else:
+    CHROMA_PERSIST_DIR = PROJECT_ROOT / _chroma_path_env
 RAG_CHUNK_SIZE = 500
 RAG_CHUNK_OVERLAP = 50
 RAG_SEARCH_K = 3

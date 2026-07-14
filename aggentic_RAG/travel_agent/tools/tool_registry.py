@@ -16,30 +16,8 @@ class ToolDefinition:
     mcp_tool_name: Optional[str] = None  # MCP工具名称（仅MCP工具需要）
 
 
-# 所有可用工具的定义
+# 主 Agent 使用的 MCP 与模型工具定义。RAG 工具由 app.py 根据知识库状态创建。
 AVAILABLE_TOOLS: List[ToolDefinition] = [
-    # ========== RAG 工具 ==========
-    ToolDefinition(
-        name="rag_search",
-        description="从知识库中检索旅游攻略和景点信息。当需要了解某个城市的旅游攻略、景点推荐、特色美食、最佳游玩时间等信息时使用。",
-        parameters={
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "检索查询词，例如：'苏州 景点'、'杭州 美食'、'北京 旅游攻略'"
-                },
-                "k": {
-                    "type": "integer",
-                    "description": "返回结果数量，默认3",
-                    "default": 3
-                }
-            },
-            "required": ["query"]
-        },
-        tool_type="rag"
-    ),
-    
     # ========== 高德地图 MCP 工具 ==========
     ToolDefinition(
         name="gaode_poi_search",
@@ -236,51 +214,5 @@ AVAILABLE_TOOLS: List[ToolDefinition] = [
         },
         tool_type="r1"
     ),
-    
-    # ========== 特殊工具 ==========
-    ToolDefinition(
-        name="final_answer",
-        description="表示已经收集到足够的信息，可以生成最终答案了。当所有必要信息都已收集完成时使用此工具，系统将进入答案生成阶段。",
-        parameters={
-            "type": "object",
-            "properties": {},
-            "required": []
-        },
-        tool_type="special"
-    ),
 ]
-
-
-def get_tool_by_name(tool_name: str) -> Optional[ToolDefinition]:
-    """根据工具名称获取工具定义"""
-    for tool in AVAILABLE_TOOLS:
-        if tool.name == tool_name:
-            return tool
-    return None
-
-
-def get_all_tools() -> List[ToolDefinition]:
-    """获取所有可用工具"""
-    return AVAILABLE_TOOLS
-
-
-def get_tools_description_for_llm() -> str:
-    """生成供LLM使用的工具描述文本"""
-    descriptions = []
-    for tool in AVAILABLE_TOOLS:
-        desc = f"- {tool.name}: {tool.description}"
-        # 添加参数说明
-        params = tool.parameters.get("properties", {})
-        if params:
-            param_list = []
-            for param_name, param_schema in params.items():
-                param_desc = param_schema.get("description", "")
-                required = param_name in tool.parameters.get("required", [])
-                required_mark = "（必需）" if required else "（可选）"
-                param_list.append(f"  - {param_name}{required_mark}: {param_desc}")
-            if param_list:
-                desc += "\n  参数：\n" + "\n".join(param_list)
-        descriptions.append(desc)
-    
-    return "\n\n".join(descriptions)
 

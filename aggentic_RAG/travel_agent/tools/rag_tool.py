@@ -36,6 +36,8 @@ class TravelRAG:
         
         # 用于记录已导入的文档ID，避免重复
         self.imported_ids = set()
+        self.vector_store = None
+        self.retriever = None
         
         # 初始化Embeddings
         self.embeddings = DashScopeEmbeddings(
@@ -64,7 +66,6 @@ class TravelRAG:
         else:
             print(f"⚠️ 向量数据库不存在，请先加载文档: {self.persist_directory}")
             print("   使用 build_knowledge_base() 方法创建知识库")
-            self.vector_store = None
         
         # 创建检索器
         if self.vector_store:
@@ -229,8 +230,9 @@ class TravelRAG:
         """
         content = doc.page_content
         source = doc.metadata.get('source', '')
-        # 用来源+块索引+内容前100字符生成hash
-        hash_input = f"{source}:{chunk_index}:{content[:100]}"
+        # 来源名、分块位置和完整内容共同决定ID，确保跨进程稳定去重。
+        content_hash = hashlib.sha256(content.encode('utf-8')).hexdigest()
+        hash_input = f"{source}:{chunk_index}:{content_hash}"
         hash_hex = hashlib.md5(hash_input.encode('utf-8')).hexdigest()
         # 将MD5 hash转换为UUID
         return str(uuid.UUID(hash_hex))
@@ -239,13 +241,18 @@ class TravelRAG:
         self,
         source_path: str,
         file_type: str = "directory",
-        force_recreate: bool = False
-    ):
-        """构建知识库"""
+        force_recreate: bool = False,
+        source_name: Optional[str] = None,
+    ) -> dict:
+        """导入文档并更新持久化知识库。"""
         print(f"\n📂 正在加载文档: {source_path}")
         
         # 加载文档
         documents = self.load_documents(source_path, file_type)
+
+        if source_name:
+            for document in documents:
+                document.metadata["source"] = source_name
         
         # 分割文档
         split_docs = self.text_splitter.split_documents(documents)
@@ -270,7 +277,7 @@ class TravelRAG:
         
         if len(split_docs) == 0:
             print(f"⚠️ 没有新文档需要导入")
-            return
+            return {"added": 0, **self.get_stats()}
         
         # 创建或更新向量数据库
         if force_recreate and os.path.exists(self.persist_directory):
@@ -310,6 +317,7 @@ class TravelRAG:
             search_type="similarity",
             search_kwargs={"k": RAG_SEARCH_K}
         )
+        return {"added": len(split_docs), **self.get_stats()}
     
     def delete_by_source(self, source_path: str) -> int:
         """根据来源文件删除数据

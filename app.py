@@ -1,35 +1,26 @@
 """
 智能旅游规划助手 - Streamlit UI
-基于LangChain Agent，无递归限制
+基于 LangChain ReAct Agent
 """
 import streamlit as st
 import tempfile
 import os
 import asyncio
+import json
 import warnings
-from typing import List, Dict, Any
+from datetime import datetime
+from hashlib import sha256
+from pathlib import Path
+from typing import List
 
 # suppress warnings
 warnings.filterwarnings('ignore', category=DeprecationWarning)
 warnings.filterwarnings('ignore', message='.*LangChainDeprecationWarning.*')
 from langchain_classic.memory import ConversationBufferMemory
 from langchain_community.chat_message_histories import StreamlitChatMessageHistory
-from langchain_community.document_loaders import (
-    TextLoader,
-    PyPDFLoader,
-    CSVLoader,
-    DirectoryLoader
-)
 from langchain_openai import ChatOpenAI
-from langchain_chroma import Chroma
 from langchain_core.prompts import PromptTemplate
-from langchain_text_splitters import (
-    RecursiveCharacterTextSplitter,
-    CharacterTextSplitter
-)
 from langchain_classic.agents import create_react_agent, AgentExecutor
-from langchain_community.callbacks.streamlit import StreamlitCallbackHandler
-from langchain_community.embeddings import DashScopeEmbeddings
 from langchain_classic.tools import Tool
 from dotenv import load_dotenv
 
@@ -54,7 +45,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'aggentic_RAG'))
 
 # 应用标题
 st.title("🗺️ 智能旅游规划助手")
-st.markdown("基于RAG + Agentic AI的旅游规划系统，无递归限制")
+st.markdown("基于 RAG、模型协作和 MCP 工具的旅游规划系统")
 
 # 侧边栏 - 文档上传
 with st.sidebar:
@@ -63,9 +54,9 @@ with st.sidebar:
     # 上传多种格式的文件
     uploaded_files = st.file_uploader(
         label="上传旅游攻略文档",
-        type=["txt", "pdf", "csv"],
+        type=["txt", "md", "pdf", "csv"],
         accept_multiple_files=True,
-        help="支持 TXT、PDF、CSV 格式的文档"
+        help="支持 TXT、Markdown、PDF、CSV，导入后会持久化保存"
     )
     
     st.markdown("---")
@@ -77,82 +68,87 @@ with st.sidebar:
         min_value=10,
         max_value=100,
         value=50,
-        help="Agent执行的最大步骤数，无递归限制！"
+        help="限制单次规划允许执行的最大 Agent 步骤数"
     )
     
     st.markdown("---")
     
     # 清空对话按钮
-    if st.button("🗑️ 清空聊天记录", use_container_width=True):
+    if st.button("🗑️ 清空聊天记录", width="stretch"):
         st.session_state.messages = []
+        st.session_state.pop("langchain_messages", None)
         st.rerun()
 
-# 文档上传现在是可选的
-if not uploaded_files:
-    st.info("💡 提示：您可以选择上传旅游攻略文档，或直接进行实时查询")
-    # 不再强制要求上传文档
+@st.cache_resource
+def get_persistent_rag():
+    """加载跨会话复用的持久化知识库。"""
+    from aggentic_RAG.travel_agent.tools.rag_tool import TravelRAG
+
+    return TravelRAG()
 
 
-# 配置RAG检索器
-@st.cache_resource(ttl="1h")
-def configure_rag_retriever(uploaded_files):
-    """配置RAG检索器 - 支持多种文件格式"""
-    docs = []
-    
-    # 创建临时目录存储上传的文件
-    temp_dir = tempfile.TemporaryDirectory()
-    
-    for file in uploaded_files:
-        temp_filepath = os.path.join(temp_dir.name, file.name)
-        with open(temp_filepath, "wb") as f:
-            f.write(file.getvalue())
-        
-        # 根据文件类型选择合适的 loader
-        file_extension = os.path.splitext(file.name)[1].lower()
-        
-        try:
-            if file_extension == ".txt":
-                loader = TextLoader(temp_filepath, encoding="utf-8")
-            elif file_extension == ".pdf":
-                loader = PyPDFLoader(temp_filepath)
-            elif file_extension == ".csv":
-                loader = CSVLoader(temp_filepath, encoding="utf-8")
-            else:
-                st.warning(f"跳过不支持的文件格式: {file.name}")
-                continue
-            
-            docs.extend(loader.load())
-            st.success(f"✅ 已加载: {file.name}")
-        except Exception as e:
-            st.error(f"加载 {file.name} 失败: {e}")
-    
-    # 文档分割
-    text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=500,
-        chunk_overlap=100
-    )
-    splits = text_splitter.split_documents(docs)
-    
-    # 使用Qwen的Embedding模型
-    embeddings = DashScopeEmbeddings(
-        model="text-embedding-v3",
-        dashscope_api_key=os.getenv("DASHSCOPE_API_KEY")
-    )
-    
-    # 创建向量数据库
-    vectordb = Chroma.from_documents(splits, embeddings)
-    
-    # 返回检索器
-    return vectordb.as_retriever(search_kwargs={"k": 5})
+def uploaded_files_signature(files) -> str:
+    """生成本次上传内容的稳定签名，避免同一会话重复导入。"""
+    digest = sha256()
+    for uploaded_file in sorted(files, key=lambda item: item.name):
+        digest.update(uploaded_file.name.encode("utf-8"))
+        digest.update(uploaded_file.getvalue())
+    return digest.hexdigest()
 
 
-# 配置检索器（如果有文档）
-if uploaded_files:
-    with st.spinner("正在加载文档并建立索引..."):
-        retriever = configure_rag_retriever(uploaded_files)
-        st.success(f"✅ 已加载 {len(uploaded_files)} 个文档")
-else:
-    retriever = None
+def safe_uploaded_filename(filename: str) -> str:
+    """只保留文件名，避免上传名中的路径逃出临时目录。"""
+    safe_name = Path(filename.replace("\\", "/")).name
+    if safe_name in {"", ".", ".."}:
+        raise ValueError("文件名无效")
+    return safe_name
+
+
+try:
+    persistent_rag = get_persistent_rag()
+except Exception as exc:
+    persistent_rag = None
+    st.sidebar.error(f"知识库初始化失败: {exc}")
+
+if "imported_upload_signatures" not in st.session_state:
+    st.session_state.imported_upload_signatures = set()
+
+if uploaded_files and persistent_rag:
+    upload_signature = uploaded_files_signature(uploaded_files)
+    if upload_signature not in st.session_state.imported_upload_signatures:
+        all_succeeded = True
+        with st.spinner("正在导入文档并更新持久化知识库..."):
+            with tempfile.TemporaryDirectory() as temp_dir:
+                for uploaded_file in uploaded_files:
+                    try:
+                        source_name = safe_uploaded_filename(uploaded_file.name)
+                        temp_filepath = Path(temp_dir) / source_name
+                        temp_filepath.write_bytes(uploaded_file.getvalue())
+
+                        import_result = persistent_rag.build_knowledge_base(
+                            str(temp_filepath),
+                            file_type="auto",
+                            source_name=source_name,
+                        )
+                        if import_result["added"]:
+                            st.success(
+                                f"已持久化: {source_name}"
+                                f"（新增 {import_result['added']} 个分块）"
+                            )
+                        else:
+                            st.info(f"已存在，无需重复导入: {source_name}")
+                    except Exception as exc:
+                        all_succeeded = False
+                        st.error(f"导入 {uploaded_file.name} 失败: {exc}")
+
+        if all_succeeded:
+            st.session_state.imported_upload_signatures.add(upload_signature)
+
+retriever = persistent_rag.retriever if persistent_rag else None
+knowledge_stats = persistent_rag.get_stats() if persistent_rag else {"total": 0, "sources": []}
+
+if not uploaded_files and not knowledge_stats["total"]:
+    st.info("💡 您可以上传旅游攻略文档，或直接使用实时查询工具")
 
 
 # 启用嵌套asyncio支持
@@ -160,12 +156,11 @@ import nest_asyncio
 nest_asyncio.apply()
 
 # 创建全局event loop用于MCP调用
-import asyncio
 _mcp_loop = asyncio.new_event_loop()
 _mcp_manager = None
 
 
-# ========== 预分析层：照搬旧版本 LangGraph 的分流逻辑 ==========
+# ========== 预分析层：需求提取与场景分流 ==========
 
 def detect_multi_destination(user_query: str, extraction: dict) -> dict:
     """检测是否为多目的地场景（排除往返/回程误判）
@@ -258,8 +253,6 @@ def pre_analyze_query(user_query: str, llm) -> dict:
             'multi_dest_info': {...}  # 多目的地检测结果
         }
     """
-    from datetime import datetime
-    
     today = datetime.now().strftime("%Y-%m-%d")
     current_year = datetime.now().year
     
@@ -304,7 +297,6 @@ User query: {user_query}
             if content.startswith('json'):
                 content = content[4:]
         
-        import json
         extraction = json.loads(content)
         print(f"\n📊 预分析结果: {extraction}")
         
@@ -378,16 +370,13 @@ def create_tools(retriever) -> List[Tool]:
         )
         tools.append(rag_tool)
     
-    # 2. 初始化MCP管理器
+    # 2. 读取 MCP 配置（远程连接在首次工具调用时建立）
     try:
-        get_mcp_manager_sync()  # 预初始化MCP连接
+        get_mcp_manager_sync()
     except Exception as e:
         st.warning(f"MCP初始化失败: {e}")
     
     # 3. 从tool_registry获取所有MCP工具定义
-    import json
-    from datetime import datetime
-    
     # 特殊处理函数：查询火车票（需要先获取站点代码）
     def query_train_tickets(origin: str, destination: str, date: str) -> str:
         """Query train tickets - first get station codes, then query tickets"""
@@ -789,7 +778,6 @@ def create_tools(retriever) -> List[Tool]:
 try:
     tools = create_tools(retriever)
     if tools:
-        tool_names = [t.name for t in tools]
         st.sidebar.success(f"✅ 已加载 {len(tools)} 个工具")
         # 显示工具列表以便调试
         with st.sidebar.expander("查看工具列表"):
@@ -825,7 +813,6 @@ memory = ConversationBufferMemory(
 
 
 # ReAct Prompt模板
-from datetime import datetime
 current_date = datetime.now().strftime("%Y-%m-%d")
 current_year = datetime.now().year
 
@@ -917,7 +904,6 @@ llm = get_llm()
 agent = create_react_agent(llm, tools, prompt)
 
 # 创建Agent执行器
-max_iterations = 30  # 复杂行程需要更多迭代
 agent_executor = AgentExecutor(
     agent=agent,
     tools=tools,
@@ -939,10 +925,6 @@ if user_query := st.chat_input(placeholder="请输入您的旅行需求，例如
     
     # 显示助手响应
     with st.chat_message("assistant"):
-        # 隐藏调试信息，不显示工具调用过程
-        # st_container = st.container()
-        # st_cb = StreamlitCallbackHandler(st_container)
-        
         # 配置回调（空配置，不显示执行过程）
         config = {}
         
@@ -969,14 +951,6 @@ if user_query := st.chat_input(placeholder="请输入您的旅行需求，例如
                     # 复杂场景 / 多目的地：R1 主导
                     # 先调用 R1 进行深度分析和规划
                     print(f"\n🧠 R1 主导模式: {scenario_type}")
-                    
-                    # 构建 R1 分析的上下文
-                    r1_context = {
-                        "user_query": user_query,
-                        "extraction": extraction,
-                        "scenario_type": scenario_type,
-                        "multi_dest_info": pre_analysis.get('multi_dest_info', {})
-                    }
                     
                     # 构建增强的输入，强制 Agent 先调用 r1_analysis
                     enhanced_input = f"""用户查询: {user_query}
@@ -1021,7 +995,8 @@ if user_query := st.chat_input(placeholder="请输入您的旅行需求，例如
 with st.sidebar:
     st.markdown("---")
     st.header("📊 当前配置")
-    st.write(f"- 文档数量: {len(uploaded_files)}")
+    st.write(f"- 知识库文档: {len(knowledge_stats['sources'])}")
+    st.write(f"- 知识库分块: {knowledge_stats['total']}")
     st.write(f"- 工具数量: {len(tools)}")
     st.write(f"- 最大迭代: {max_iterations}")
     st.write(f"- 对话轮数: {len(st.session_state.messages)}")

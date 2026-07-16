@@ -1,1002 +1,252 @@
-"""
-智能旅游规划助手 - Streamlit UI
-基于 LangChain ReAct Agent
-"""
-import streamlit as st
-import tempfile
 import os
-import asyncio
-import json
-import warnings
-from datetime import datetime
-from hashlib import sha256
-from pathlib import Path
-from typing import List
 
-# suppress warnings
-warnings.filterwarnings('ignore', category=DeprecationWarning)
-warnings.filterwarnings('ignore', message='.*LangChainDeprecationWarning.*')
-from langchain_classic.memory import ConversationBufferMemory
-from langchain_community.chat_message_histories import StreamlitChatMessageHistory
-from langchain_openai import ChatOpenAI
-from langchain_core.prompts import PromptTemplate
-from langchain_classic.agents import create_react_agent, AgentExecutor
-from langchain_classic.tools import Tool
-from dotenv import load_dotenv
+import httpx
+import streamlit as st
 
-# 设置页面配置（必须是第一个Streamlit命令）
+from frontend.api_client import TravelApiClient
+
+
 st.set_page_config(
-    page_title="🗺️ 智能旅游规划助手",
+    page_title="智能旅行规划助手",
     page_icon="🗺️",
-    layout="wide"
+    layout="wide",
 )
 
-# 加载环境变量（优先查找 aggentic_RAG/.env，其次查找根目录 .env）
-env_path_rag = os.path.join(os.path.dirname(__file__), 'aggentic_RAG', '.env')
-env_path_root = os.path.join(os.path.dirname(__file__), '.env')
-if os.path.exists(env_path_rag):
-    load_dotenv(dotenv_path=env_path_rag, override=True)
-else:
-    load_dotenv(dotenv_path=env_path_root, override=True)
 
-# 添加项目路径到sys.path
-import sys
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'aggentic_RAG'))
+@st.cache_resource
+def get_api_client() -> TravelApiClient:
+    return TravelApiClient(os.getenv("BACKEND_URL", "http://localhost:8000"))
 
-# 应用标题
-st.title("🗺️ 智能旅游规划助手")
-st.markdown("基于 RAG、模型协作和 MCP 工具的旅游规划系统")
 
-# 侧边栏 - 文档上传
+def reset_conversation() -> None:
+    st.session_state.conversation_id = None
+    st.session_state.loaded_conversation_id = None
+    st.session_state.messages = []
+    if "conversation_selector" in st.session_state:
+        st.session_state.conversation_selector = None
+
+
+client = get_api_client()
+st.session_state.setdefault("client_id", os.getenv("TRAVEL_CLIENT_ID", "local"))
+st.session_state.setdefault("conversation_id", None)
+st.session_state.setdefault("loaded_conversation_id", None)
+st.session_state.setdefault("messages", [])
+
+try:
+    backend_health = client.health()
+    backend_available = True
+except (httpx.HTTPError, OSError):
+    backend_health = {}
+    backend_available = False
+
+
 with st.sidebar:
-    st.header("📚 旅游攻略文档")
-    
-    # 上传多种格式的文件
-    uploaded_files = st.file_uploader(
-        label="上传旅游攻略文档",
-        type=["txt", "md", "pdf", "csv"],
-        accept_multiple_files=True,
-        help="支持 TXT、Markdown、PDF、CSV，导入后会持久化保存"
+    st.header("知识库", anchor=False)
+    if backend_available:
+        st.success("后端服务已连接", icon=":material/check_circle:")
+        st.caption(
+            f"{backend_health.get('database', 'database')} · "
+            f"{backend_health.get('embedding_provider', 'embedding')}"
+        )
+    else:
+        st.error("后端服务不可用", icon=":material/error:")
+
+    with st.form("document_upload", border=False):
+        uploaded_files = st.file_uploader(
+            "导入旅游资料",
+            type=["txt", "md", "pdf", "csv"],
+            accept_multiple_files=True,
+            max_upload_size=20,
+            disabled=not backend_available,
+        )
+        upload_submitted = st.form_submit_button(
+            "导入并索引",
+            icon=":material/upload_file:",
+            disabled=not backend_available or not uploaded_files,
+            width="stretch",
+        )
+
+    if upload_submitted and uploaded_files:
+        with st.spinner("正在解析、向量化并建立索引..."):
+            try:
+                imported = client.upload_documents(uploaded_files)
+                ready_count = sum(item["status"] == "ready" for item in imported)
+                st.success(f"已处理 {ready_count} 个文档")
+            except httpx.HTTPStatusError as exc:
+                detail = exc.response.json().get("detail", str(exc))
+                st.error(detail)
+            except httpx.HTTPError as exc:
+                st.error(f"上传失败: {exc}")
+
+    documents = []
+    if backend_available:
+        try:
+            documents = client.list_documents()
+        except httpx.HTTPError as exc:
+            st.warning(f"无法读取文档列表: {exc}")
+
+    if documents:
+        ready_documents = [item for item in documents if item["status"] == "ready"]
+        st.caption(
+            f"{len(ready_documents)} 个可用文档 · "
+            f"{sum(item['chunk_count'] for item in ready_documents)} 个分块"
+        )
+        document_by_id = {item["id"]: item for item in documents}
+        selected_document_id = st.selectbox(
+            "管理文档",
+            options=list(document_by_id),
+            format_func=lambda value: (
+                f"{document_by_id[value]['filename']} · "
+                f"{document_by_id[value]['status']} · "
+                f"{document_by_id[value]['chunk_count']}块"
+            ),
+        )
+        with st.container(horizontal=True):
+            if st.button(
+                "重新索引",
+                icon=":material/refresh:",
+                disabled=not backend_available,
+            ):
+                with st.spinner("正在重新索引..."):
+                    try:
+                        client.reindex_document(selected_document_id)
+                        st.rerun()
+                    except httpx.HTTPError as exc:
+                        st.error(f"重新索引失败: {exc}")
+            if st.button(
+                "删除",
+                icon=":material/delete:",
+                disabled=not backend_available,
+            ):
+                try:
+                    client.delete_document(selected_document_id)
+                    st.rerun()
+                except httpx.HTTPError as exc:
+                    st.error(f"删除失败: {exc}")
+    else:
+        st.caption("知识库中暂无文档")
+
+    st.divider()
+    st.header("会话", anchor=False)
+    st.button(
+        "新建会话",
+        icon=":material/add_comment:",
+        on_click=reset_conversation,
+        width="stretch",
     )
-    
-    st.markdown("---")
-    
-    # 系统配置
-    st.header("⚙️ 系统配置")
-    max_iterations = st.slider(
-        "最大迭代次数",
-        min_value=10,
-        max_value=100,
-        value=50,
-        help="限制单次规划允许执行的最大 Agent 步骤数"
+
+    conversations = []
+    if backend_available:
+        try:
+            conversations = client.list_conversations(st.session_state.client_id)
+        except httpx.HTTPError:
+            conversations = []
+
+    if conversations:
+        conversation_by_id = {item["id"]: item for item in conversations}
+        selected_conversation_id = st.selectbox(
+            "历史会话",
+            options=[None, *conversation_by_id],
+            format_func=lambda value: (
+                "当前新会话" if value is None else conversation_by_id[value]["title"]
+            ),
+            key="conversation_selector",
+        )
+        if (
+            selected_conversation_id
+            and selected_conversation_id != st.session_state.loaded_conversation_id
+        ):
+            try:
+                detail = client.get_conversation(
+                    selected_conversation_id,
+                    st.session_state.client_id,
+                )
+                st.session_state.conversation_id = selected_conversation_id
+                st.session_state.loaded_conversation_id = selected_conversation_id
+                st.session_state.messages = detail["messages"]
+                st.rerun()
+            except httpx.HTTPError as exc:
+                st.error(f"加载会话失败: {exc}")
+
+
+st.title("智能旅行规划助手")
+st.caption("实时工具、持久化知识库与来源引用")
+
+if not st.session_state.messages and backend_available:
+    suggestions = {
+        "成都三日游": "从上海出发去成都玩3天，预算4000元，喜欢美食和人文景点",
+        "北京亲子游": "规划北京4天亲子游，有老人和孩子同行",
+        "上海攻略": "上海有哪些适合第一次去的景点和本地美食？",
+    }
+    selected_suggestion = st.pills(
+        "示例问题",
+        options=list(suggestions),
+        label_visibility="collapsed",
     )
-    
-    st.markdown("---")
-    
-    # 清空对话按钮
-    if st.button("🗑️ 清空聊天记录", width="stretch"):
-        st.session_state.messages = []
-        st.session_state.pop("langchain_messages", None)
+    if selected_suggestion:
+        st.session_state.pending_prompt = suggestions[selected_suggestion]
         st.rerun()
 
-@st.cache_resource
-def get_persistent_rag():
-    """加载跨会话复用的持久化知识库。"""
-    from aggentic_RAG.travel_agent.tools.rag_tool import TravelRAG
 
-    return TravelRAG()
-
-
-def uploaded_files_signature(files) -> str:
-    """生成本次上传内容的稳定签名，避免同一会话重复导入。"""
-    digest = sha256()
-    for uploaded_file in sorted(files, key=lambda item: item.name):
-        digest.update(uploaded_file.name.encode("utf-8"))
-        digest.update(uploaded_file.getvalue())
-    return digest.hexdigest()
-
-
-def safe_uploaded_filename(filename: str) -> str:
-    """只保留文件名，避免上传名中的路径逃出临时目录。"""
-    safe_name = Path(filename.replace("\\", "/")).name
-    if safe_name in {"", ".", ".."}:
-        raise ValueError("文件名无效")
-    return safe_name
-
-
-try:
-    persistent_rag = get_persistent_rag()
-except Exception as exc:
-    persistent_rag = None
-    st.sidebar.error(f"知识库初始化失败: {exc}")
-
-if "imported_upload_signatures" not in st.session_state:
-    st.session_state.imported_upload_signatures = set()
-
-if uploaded_files and persistent_rag:
-    upload_signature = uploaded_files_signature(uploaded_files)
-    if upload_signature not in st.session_state.imported_upload_signatures:
-        all_succeeded = True
-        with st.spinner("正在导入文档并更新持久化知识库..."):
-            with tempfile.TemporaryDirectory() as temp_dir:
-                for uploaded_file in uploaded_files:
-                    try:
-                        source_name = safe_uploaded_filename(uploaded_file.name)
-                        temp_filepath = Path(temp_dir) / source_name
-                        temp_filepath.write_bytes(uploaded_file.getvalue())
-
-                        import_result = persistent_rag.build_knowledge_base(
-                            str(temp_filepath),
-                            file_type="auto",
-                            source_name=source_name,
-                        )
-                        if import_result["added"]:
-                            st.success(
-                                f"已持久化: {source_name}"
-                                f"（新增 {import_result['added']} 个分块）"
-                            )
-                        else:
-                            st.info(f"已存在，无需重复导入: {source_name}")
-                    except Exception as exc:
-                        all_succeeded = False
-                        st.error(f"导入 {uploaded_file.name} 失败: {exc}")
-
-        if all_succeeded:
-            st.session_state.imported_upload_signatures.add(upload_signature)
-
-retriever = persistent_rag.retriever if persistent_rag else None
-knowledge_stats = persistent_rag.get_stats() if persistent_rag else {"total": 0, "sources": []}
-
-if not uploaded_files and not knowledge_stats["total"]:
-    st.info("💡 您可以上传旅游攻略文档，或直接使用实时查询工具")
-
-
-# 启用嵌套asyncio支持
-import nest_asyncio
-nest_asyncio.apply()
-
-# 创建全局event loop用于MCP调用
-_mcp_loop = asyncio.new_event_loop()
-_mcp_manager = None
-
-
-# ========== 预分析层：需求提取与场景分流 ==========
-
-def detect_multi_destination(user_query: str, extraction: dict) -> dict:
-    """检测是否为多目的地场景（排除往返/回程误判）
-    
-    照搬自 nodes.py 中的 detect_multi_destination 函数
-    """
-    # === 1) 优先排除往返场景 ===
-    roundtrip_keywords = ["往返", "来回", "回程", "返程", "返回"]
-    if any(kw in user_query for kw in roundtrip_keywords):
-        print("  🔄 检测到往返关键词，不算多目的地")
-        return {
-            'is_multi_destination': False,
-            'detected_keywords': [],
-            'raw_destination_text': extraction.get('destination', ''),
-            'detection_method': 'roundtrip_excluded'
-        }
-    
-    # === 2) 多目的地关键词 ===
-    multi_dest_keywords = [
-        "再去", "然后去", "接着去", "顺便去",
-        "再到", "然后到", "接着到",
-        "再去看看", "再看看",
-        "之后去", "之后到"
-    ]
-    detected_keywords = [kw for kw in multi_dest_keywords if kw in user_query]
-    if detected_keywords:
-        return {
-            'is_multi_destination': True,
-            'detected_keywords': detected_keywords,
-            'raw_destination_text': extraction.get('destination', ''),
-            'detection_method': 'keyword'
-        }
-    
-    # === 3) 目的地字段中包含多个城市（逗号/顿号/“和”分隔） ===
-    destination = extraction.get('destination', '') or ''
-    origin = extraction.get('origin', '') or ''
-    
-    # 统一分隔符
-    norm = destination.replace(',', '，').replace('、', '，').replace('和', '，')
-    cities = [c.strip() for c in norm.split('，') if c.strip()]
-    
-    # 去重保持顺序
-    unique_cities = []
-    for c in cities:
-        if c not in unique_cities:
-            unique_cities.append(c)
-    
-    if len(unique_cities) >= 3:
-        return {
-            'is_multi_destination': True,
-            'detected_keywords': [],
-            'raw_destination_text': destination,
-            'detection_method': 'comma_separated_3plus'
-        }
-    
-    if len(unique_cities) == 2:
-        # 如果两个城市中包含出发地，通常是往返（例如 上海, 南京）→ 视为单目的地
-        if origin and origin in unique_cities:
-            return {
-                'is_multi_destination': False,
-                'detected_keywords': [],
-                'raw_destination_text': destination,
-                'detection_method': 'origin_pair_excluded'
-            }
-        # 两个且都不是出发地 → 多目的地
-        return {
-            'is_multi_destination': True,
-            'detected_keywords': [],
-            'raw_destination_text': destination,
-            'detection_method': 'comma_separated_2'
-        }
-    
-    return {
-        'is_multi_destination': False,
-        'detected_keywords': [],
-        'raw_destination_text': destination
-    }
-
-
-def pre_analyze_query(user_query: str, llm) -> dict:
-    """预分析用户查询，判断场景类型
-    
-    照搬自 nodes.py 中的 planner_node 逻辑
-    
-    返回:
-        dict: {
-            'scenario_type': 'simple' | 'complex' | 'multi_destination',
-            'needs_deep_analysis': bool,  # 是否需要R1主导
-            'extraction': {...},  # 提取的信息
-            'multi_dest_info': {...}  # 多目的地检测结果
-        }
-    """
-    today = datetime.now().strftime("%Y-%m-%d")
-    current_year = datetime.now().year
-    
-    # 构建提取 prompt，参考旧版本的 PLANNER_SYSTEM_PROMPT
-    extraction_prompt = f"""You are a travel planning assistant. Today's date is {today}.
-
-Your task: Extract key information from the user query and determine if it needs deep analysis.
-
-RULES:
-- Output ONLY valid JSON. NO explanations, NO markdown code blocks.
-- Date conversion: "今天"/"today" = {today}, "明天"/"tomorrow" = +1 day, etc.
-- Use Chinese for city names.
-- Set "needs_deep_analysis" to true if:
-  * Complex multi-city routes (e.g., "A和B", "A再去B")
-  * Budget optimization needed (tight budget with many requirements)
-  * Multiple conflicting constraints (e.g., elderly + children, limited time + many places)
-  * Special needs: 老人, 小孩, 儿童, 亲子, 残疾, etc.
-
-Output this exact JSON structure:
-{{
-  "destination": "extracted destination city or cities (comma separated if multiple)",
-  "origin": "extracted origin city",
-  "travel_days": 0,
-  "budget": 0,
-  "travel_date": "YYYY-MM-DD",
-  "preferences": ["preference1"],
-  "needs_deep_analysis": false,
-  "has_special_needs": false
-}}
-
-User query: {user_query}
-"""
-    
-    try:
-        response = llm.invoke(extraction_prompt)
-        content = response.content.strip()
-        
-        # 移除可能的markdown代码块
-        if content.startswith('```'):
-            lines = content.split('\n')
-            content = '\n'.join(lines[1:-1]) if len(lines) > 2 else content
-            if content.startswith('json'):
-                content = content[4:]
-        
-        extraction = json.loads(content)
-        print(f"\n📊 预分析结果: {extraction}")
-        
-    except Exception as e:
-        print(f"⚠️ 预分析失败: {e}")
-        # 默认值
-        extraction = {
-            "destination": "",
-            "origin": "",
-            "travel_days": 0,
-            "budget": 0,
-            "travel_date": "",
-            "preferences": [],
-            "needs_deep_analysis": False,
-            "has_special_needs": False
-        }
-    
-    # 检测多目的地场景
-    multi_dest_info = detect_multi_destination(user_query, extraction)
-    
-    # 确定场景类型和是否需要R1
-    if multi_dest_info.get('is_multi_destination', False):
-        scenario_type = 'multi_destination'
-        needs_r1 = True
-        print(f"  🌍 检测到多目的地场景: {multi_dest_info.get('detection_method')}")
-    elif extraction.get('needs_deep_analysis', False) or extraction.get('has_special_needs', False):
-        scenario_type = 'complex'
-        needs_r1 = True
-        print(f"  🧠 检测到复杂场景（特殊需求/预算紧张）")
-    else:
-        scenario_type = 'simple'
-        needs_r1 = False
-        print(f"  ✅ 简单场景，Qwen3主导")
-    
-    return {
-        'scenario_type': scenario_type,
-        'needs_deep_analysis': needs_r1,
-        'extraction': extraction,
-        'multi_dest_info': multi_dest_info
-    }
-
-def get_mcp_manager_sync():
-    """Sync wrapper to get MCP manager"""
-    global _mcp_manager
-    if _mcp_manager is None:
-        from aggentic_RAG.travel_agent.tools.mcp_tools import MCPToolManager
-        _mcp_manager = MCPToolManager()
-        _mcp_loop.run_until_complete(_mcp_manager.initialize())
-    return _mcp_manager
-
-def call_mcp_tool_sync(server_name: str, tool_name: str, **kwargs) -> str:
-    """Sync wrapper to call MCP tool"""
-    manager = get_mcp_manager_sync()
-    return _mcp_loop.run_until_complete(manager.call_tool(server_name, tool_name, **kwargs))
-
-
-# 创建工具列表
-def create_tools(retriever) -> List[Tool]:
-    """创建Agent可用的工具列表"""
-    from langchain_classic.tools.retriever import create_retriever_tool
-    from aggentic_RAG.travel_agent.tools.tool_registry import AVAILABLE_TOOLS
-    
-    tools = []
-    
-    # 1. RAG检索工具（如果有文档）
-    if retriever is not None:
-        rag_tool = create_retriever_tool(
-            retriever=retriever,
-            name="rag_search",
-            description="用于查询旅游攻略、景点信息、美食推荐等。输入城市名或景点名。"
-        )
-        tools.append(rag_tool)
-    
-    # 2. 读取 MCP 配置（远程连接在首次工具调用时建立）
-    try:
-        get_mcp_manager_sync()
-    except Exception as e:
-        st.warning(f"MCP初始化失败: {e}")
-    
-    # 3. 从tool_registry获取所有MCP工具定义
-    # 特殊处理函数：查询火车票（需要先获取站点代码）
-    def query_train_tickets(origin: str, destination: str, date: str) -> str:
-        """Query train tickets - first get station codes, then query tickets"""
-        print(f"\n🚂 [train_query] 调用: {origin} -> {destination}, {date}")
-        try:
-            # 1. 修正日期年份
-            try:
-                date_obj = datetime.strptime(date, "%Y-%m-%d")
-                current_year = datetime.now().year
-                if date_obj.year < current_year:
-                    date = date.replace(str(date_obj.year), str(current_year))
-                    print(f"  日期修正为: {date}")
-            except:
-                pass
-            
-            # 2. 获取站点代码
-            from_code = None
-            to_code = None
-            
-            # 分别查询每个城市的站点代码
-            for city, is_origin in [(origin, True), (destination, False)]:
-                try:
-                    print(f"  获取{city}站点代码...")
-                    codes_result = call_mcp_tool_sync(
-                        "12306 Server",
-                        "get-stations-code-in-city",
-                        city=city
+for message in st.session_state.messages:
+    with st.chat_message(message["role"]):
+        st.markdown(message["content"])
+        citations = message.get("citations", [])
+        if citations:
+            with st.expander("查看引用资料"):
+                for citation in citations:
+                    page = f" · 第{citation['page']}页" if citation.get("page") else ""
+                    st.markdown(
+                        f"**[来源{citation['index']}] {citation['source']}{page}**  "
+                        f"\n{citation['excerpt']}"
                     )
-                    print(f"  {city}站点查询结果: {str(codes_result)[:150]}")
-                    
-                    if codes_result and "error" not in str(codes_result).lower():
-                        codes_data = json.loads(codes_result) if isinstance(codes_result, str) else codes_result
-                        
-                        # 处理数组格式 - 找主站（站名与城市名匹配的）
-                        if isinstance(codes_data, list) and len(codes_data) > 0:
-                            code = None
-                            station_name = None
-                            
-                            # 优先找完全匹配的主站（如"上海"->"上海", "徐州"->"徐州"）
-                            for station in codes_data:
-                                name = station.get('station_name', '')
-                                if name == city:  # 完全匹配
-                                    code = station.get('station_code') or station.get('code') or station.get('telecode')
-                                    station_name = name
-                                    break
-                            
-                            # 其次找包含城市名的站（如"上海"->"上海虹桥", "上海南"）
-                            if not code:
-                                for station in codes_data:
-                                    name = station.get('station_name', '')
-                                    if city in name and '东' not in name and '南' not in name and '西' not in name and '北' not in name:
-                                        code = station.get('station_code') or station.get('code') or station.get('telecode')
-                                        station_name = name
-                                        break
-                            
-                            # 最后尝试第一个包含城市名的站
-                            if not code:
-                                for station in codes_data:
-                                    name = station.get('station_name', '')
-                                    if city in name:
-                                        code = station.get('station_code') or station.get('code') or station.get('telecode')
-                                        station_name = name
-                                        break
-                            
-                            if code:
-                                if is_origin:
-                                    from_code = code
-                                else:
-                                    to_code = code
-                                print(f"  ✅ {city}站点: {station_name} (代码: {code})")
-                            else:
-                                print(f"  ⚠️ {city}未找到匹配的主站")
-                except Exception as e:
-                    print(f"  {city}站点查询异常: {e}")
-            
-            print(f"  站点代码汇总: {origin}={from_code}, {destination}={to_code}")
-            
-            # 3. 查询车票
-            train_result = None
-            if from_code and to_code:
-                print(f"  步骤2: 使用站点代码查询车票...")
-                train_result = call_mcp_tool_sync(
-                    "12306 Server",
-                    "get-tickets",
-                    fromStation=from_code,
-                    toStation=to_code,
-                    date=date
-                )
-                print(f"  车票查询结果: {str(train_result)[:300]}")
-            else:
-                # 备选：直接使用城市名查询
-                print(f"  步骤2(备选): 直接使用城市名查询...")
-                train_result = call_mcp_tool_sync(
-                    "12306 Server",
-                    "get-tickets",
-                    fromStation=origin,
-                    toStation=destination,
-                    date=date
-                )
-                print(f"  车票查询结果: {str(train_result)[:300]}")
-            
-            # 4. 同时查询自驾路线（照搬旧版本行为）
-            driving_result = None
-            try:
-                print(f"\n🚗 步骤3: 自动查询自驾路线信息")
-                
-                # 先获取城市经纬度
-                origin_coords = None
-                dest_coords = None
-                
-                try:
-                    origin_geo = call_mcp_tool_sync("Gaode Server", "maps_geo", address=origin)
-                    if origin_geo and "error" not in str(origin_geo).lower():
-                        geo_data = json.loads(origin_geo) if isinstance(origin_geo, str) else origin_geo
-                        if isinstance(geo_data, dict) and 'return' in geo_data:
-                            if isinstance(geo_data['return'], list) and len(geo_data['return']) > 0:
-                                origin_coords = geo_data['return'][0].get('location')
-                    
-                    dest_geo = call_mcp_tool_sync("Gaode Server", "maps_geo", address=destination)
-                    if dest_geo and "error" not in str(dest_geo).lower():
-                        geo_data = json.loads(dest_geo) if isinstance(dest_geo, str) else dest_geo
-                        if isinstance(geo_data, dict) and 'return' in geo_data:
-                            if isinstance(geo_data['return'], list) and len(geo_data['return']) > 0:
-                                dest_coords = geo_data['return'][0].get('location')
-                    
-                    if origin_coords and dest_coords:
-                        print(f"  ✅ 经纬度: {origin}={origin_coords}, {destination}={dest_coords}")
-                        driving_result = call_mcp_tool_sync(
-                            "Gaode Server",
-                            "maps_direction_driving",
-                            origin=origin_coords,
-                            destination=dest_coords
-                        )
-                        print(f"  ✅ 自驾路线查询成功: {str(driving_result)[:200]}")
-                    else:
-                        print(f"  ⚠️ 无法获取经纬度，跳过自驾路线")
-                except Exception as geo_err:
-                    print(f"  ⚠️ 地理编码失败: {geo_err}")
-            except Exception as driving_err:
-                print(f"  ⚠️ 自驾路线查询异常: {driving_err}")
-            
-            # 5. 组合返回结果（包含火车和自驾信息）
-            combined_result = {}
-            if train_result:
-                combined_result["train"] = train_result
-            if driving_result:
-                combined_result["driving"] = driving_result
-            
-            if combined_result:
-                return json.dumps(combined_result, ensure_ascii=False)
-            else:
-                return "交通查询失败"
-        except Exception as e:
-            print(f"  火车票查询异常: {e}")
-            return f"火车票查询失败: {str(e)}"
-    
-    for tool_def in AVAILABLE_TOOLS:
-        if tool_def.tool_type == "mcp":
-            # 特殊处理train_query
-            if tool_def.name == "train_query":
-                def train_tool_func(tool_input: str) -> str:
-                    try:
-                        if tool_input.strip().startswith('{'):
-                            kwargs = json.loads(tool_input)
-                        else:
-                            return "请提供JSON格式的参数"
-                        
-                        origin = kwargs.get("origin") or kwargs.get("from") or kwargs.get("fromStation", "")
-                        destination = kwargs.get("destination") or kwargs.get("to") or kwargs.get("toStation", "")
-                        date = kwargs.get("date", "")
-                        
-                        return query_train_tickets(origin, destination, date)
-                    except Exception as e:
-                        return f"参数解析失败: {str(e)}"
-                
-                tools.append(Tool(
-                    name=tool_def.name,
-                    description=tool_def.description,
-                    func=train_tool_func
-                ))
-                continue
-            
-            # 其他MCP工具的通用处理
-            def make_sync_tool(server_name, mcp_tool_name, tool_name):
-                def call_tool(tool_input: str) -> str:
-                    """Parse input string and call MCP tool"""
-                    print(f"\n🛠️ [{tool_name}] 调用: {tool_input[:100]}")
-                    try:
-                        if tool_input.strip().startswith('{'):
-                            kwargs = json.loads(tool_input)
-                        else:
-                            kwargs = {"query": tool_input}
-                        
-                        # 修正日期年份
-                        if "date" in kwargs:
-                            date_str = kwargs["date"]
-                            try:
-                                date_obj = datetime.strptime(date_str, "%Y-%m-%d")
-                                current_year = datetime.now().year
-                                if date_obj.year < current_year:
-                                    kwargs["date"] = date_str.replace(str(date_obj.year), str(current_year))
-                            except:
-                                pass
-                        
-                        # 黄历工具特殊处理 - 转换为ISO时间格式
-                        if tool_name == "lucky_day":
-                            date_val = kwargs.pop('date', None) or kwargs.pop('query', '')
-                            # 确保日期格式正确
-                            if date_val:
-                                date_val = date_val.strip()
-                                kwargs = {"solarDatetime": f"{date_val}T12:00:00+08:00"}
-                        
-                        # 航班查询工具 - 参数映射
-                        if tool_name == "flight_query":
-                            dep = kwargs.pop('dep', None) or kwargs.pop('from', None) or kwargs.pop('origin', '')
-                            arr = kwargs.pop('arr', None) or kwargs.pop('to', None) or kwargs.pop('destination', '')
-                            date_val = kwargs.pop('date', '')
-                            # 修正日期年份
-                            if date_val:
-                                try:
-                                    date_obj = datetime.strptime(date_val.strip(), "%Y-%m-%d")
-                                    if date_obj.year < datetime.now().year:
-                                        date_val = date_val.replace(str(date_obj.year), str(datetime.now().year))
-                                except:
-                                    pass
-                            kwargs = {"dep": dep, "arr": arr, "date": date_val}
-                        
-                        # 天气工具 - 确保city参数
-                        if tool_name == "gaode_weather":
-                            city = kwargs.pop("city", None) or kwargs.pop("location", None) or kwargs.pop("query", "")
-                            # 清理城市名：去除日期、空格、逗号后的内容
-                            if city:
-                                city = city.strip()
-                                # 如果包含逗号，取第一部分
-                                if ',' in city:
-                                    city = city.split(',')[0].strip()
-                                if '，' in city:
-                                    city = city.split('，')[0].strip()
-                                # 去除"市"后缀保留纯城市名
-                                city = city.replace('市', '')
-                            kwargs = {"city": city}
-                        
-                        # 地理编码工具 - 确保address参数
-                        if tool_name == "gaode_geo":
-                            address = kwargs.pop("address", None) or kwargs.pop("location", None) or kwargs.pop("query", "")
-                            kwargs = {"address": address}
-                        
-                        # 酒店搜索工具 - 确保keywords和city参数
-                        if tool_name == "gaode_hotel_search":
-                            keywords = kwargs.pop("keywords", None) or kwargs.pop("keyword", None) or kwargs.pop("query", "")
-                            city = kwargs.pop("city", None) or kwargs.pop("location", "")
-                            # 如果keywords没有包含"酒店"或"民宿"，自动补充
-                            if keywords and "酒店" not in keywords and "民宿" not in keywords:
-                                keywords = f"{keywords} 酒店"
-                            kwargs = {"keywords": keywords, "city": city} if city else {"keywords": keywords}
-                        
-                        # POI搜索工具 - 确保keywords参数
-                        if tool_name == "gaode_poi_search":
-                            keywords = kwargs.pop("keywords", None) or kwargs.pop("keyword", None) or kwargs.pop("query", "")
-                            city = kwargs.pop("city", None) or kwargs.pop("location", "")
-                            kwargs = {"keywords": keywords, "city": city} if city else {"keywords": keywords}
-                        
-                        # 自驾路线工具 - 确保origin和destination参数（应为坐标）
-                        if tool_name == "gaode_driving":
-                            origin = kwargs.pop("origin", None) or kwargs.pop("from", "")
-                            destination = kwargs.pop("destination", None) or kwargs.pop("to", "")
-                            kwargs = {"origin": origin, "destination": destination}
-                        
-                        print(f"  参数: {kwargs}")
-                        return call_mcp_tool_sync(server_name, mcp_tool_name, **kwargs)
-                    except json.JSONDecodeError:
-                        # 对于简单字符串输入，根据工具类型处理
-                        print(f"  简单字符串输入: {tool_input}")
-                        tool_input_clean = tool_input.strip()
-                        
-                        if tool_name == "gaode_weather":
-                            city = tool_input_clean
-                            if ',' in city:
-                                city = city.split(',')[0].strip()
-                            if '，' in city:
-                                city = city.split('，')[0].strip()
-                            city = city.replace('市', '')
-                            return call_mcp_tool_sync(server_name, mcp_tool_name, city=city)
-                        elif tool_name == "gaode_geo":
-                            return call_mcp_tool_sync(server_name, mcp_tool_name, address=tool_input_clean)
-                        elif tool_name == "lucky_day":
-                            iso_dt = f"{tool_input_clean}T12:00:00+08:00"
-                            return call_mcp_tool_sync(server_name, mcp_tool_name, solarDatetime=iso_dt)
-                        elif tool_name == "gaode_hotel_search":
-                            # 如果输入是城市名，补充酒店关键词
-                            keywords = f"{tool_input_clean} 酒店" if "酒店" not in tool_input_clean else tool_input_clean
-                            return call_mcp_tool_sync(server_name, mcp_tool_name, keywords=keywords)
-                        elif tool_name == "gaode_poi_search":
-                            return call_mcp_tool_sync(server_name, mcp_tool_name, keywords=tool_input_clean)
-                        else:
-                            return call_mcp_tool_sync(server_name, mcp_tool_name, query=tool_input_clean)
-                    except Exception as e:
-                        return f"工具调用失败: {str(e)}"
-                return call_tool
-            
-            # 创建工具
-            mcp_tool = Tool(
-                name=tool_def.name,
-                description=tool_def.description,
-                func=make_sync_tool(tool_def.server_name, tool_def.mcp_tool_name, tool_def.name)
-            )
-            tools.append(mcp_tool)
-        
-        elif tool_def.tool_type == "r1":
-            # R1 深度分析工具 - 使用 DeepSeek R1 API
-            def make_r1_tool():
-                def call_r1_analysis(tool_input: str) -> str:
-                    """使用DeepSeek R1进行深度分析"""
-                    print(f"\n🧠 [r1_analysis] 深度分析调用: {tool_input[:200]}")
-                    try:
-                        if tool_input.strip().startswith('{'):
-                            kwargs = json.loads(tool_input)
-                        else:
-                            kwargs = {"problem": tool_input, "context": {}}
-                        
-                        problem = kwargs.get("problem", "")
-                        context = kwargs.get("context", {})
-                        
-                        # 调用DeepSeek R1 API（使用正确的 DeepSeek 配置）
-                        from openai import OpenAI
-                        
-                        # DeepSeek R1 使用其自己的 API
-                        deepseek_api_key = os.getenv("DEEPSEEK_API_KEY", "")
-                        if not deepseek_api_key:
-                            return "深度分析不可用: 未配置 DEEPSEEK_API_KEY"
-                        
-                        r1_client = OpenAI(
-                            api_key=deepseek_api_key,
-                            base_url="https://api.deepseek.com"
-                        )
-                        
-                        # 构建分析请求 - 参考旧版本 nodes.py 中 R1 的 prompt 风格
-                        analysis_prompt = f"""你是一个专业的旅行规划优化师。请对以下旅行规划问题进行深度分析和优化：
-
-问题描述：{problem}
-
-已收集的信息：
-{json.dumps(context, ensure_ascii=False, indent=2) if context else '无额外上下文'}
-
-你的任务：
-1. **路线优化**：分析多段行程的最优顺序和连接方式
-2. **时间安排**：每个目的地的合理停留时间
-3. **预算分配**：根据各段行程的物价和景点密度分配预算
-4. **风险评估**：识别天气、交通、时间等风险
-5. **备选方案**：提供经济型、舒适型等不同方案
-
-输出JSON格式（纯JSON，不要markdown代码块）：
-{{
-  "route_optimization": "路线优化建议",
-  "time_arrangement": "时间安排建议",
-  "budget_allocation": {{
-    "城市名": 预算金额
-  }},
-  "risk_warnings": ["风险1", "风险2"],
-  "alternative_plans": [
-    {{
-      "name": "方案名称",
-      "description": "方案描述",
-      "total_cost": 总费用,
-      "pros": ["优点1"],
-      "cons": ["缺点1"]
-    }}
-  ],
-  "final_recommendation": "最终建议"
-}}
-"""
-                        
-                        response = r1_client.chat.completions.create(
-                            model="deepseek-reasoner",  # 使用正确的模型名
-                            messages=[{"role": "user", "content": analysis_prompt}],
-                            max_tokens=4000
-                        )
-                        
-                        result = response.choices[0].message.content
-                        print(f"  R1分析完成，返回 {len(result)} 字符")
-                        return result
-                    except Exception as e:
-                        print(f"  R1分析失败: {e}")
-                        import traceback
-                        traceback.print_exc()
-                        return f"深度分析暂时不可用: {str(e)}"
-                return call_r1_analysis
-            
-            tools.append(Tool(
-                name=tool_def.name,
-                description=tool_def.description,
-                func=make_r1_tool()
-            ))
-    
-    return tools
+        tools = message.get("tools", [])
+        if tools:
+            with st.expander("查看实时工具状态"):
+                for tool in tools:
+                    icon = ":material/check_circle:" if tool["success"] else ":material/error:"
+                    st.markdown(
+                        f"{icon} `{tool['name']}` · {tool['latency_ms']}ms"
+                    )
 
 
-# 创建工具
-try:
-    tools = create_tools(retriever)
-    if tools:
-        st.sidebar.success(f"✅ 已加载 {len(tools)} 个工具")
-        # 显示工具列表以便调试
-        with st.sidebar.expander("查看工具列表"):
-            for t in tools:
-                st.write(f"- {t.name}")
-    else:
-        st.sidebar.warning("⚠️ 未加载任何工具")
-except Exception as e:
-    st.sidebar.error(f"❌ 工具加载失败: {e}")
-    tools = []
-
-
-# 初始化聊天历史
-if "messages" not in st.session_state:
-    st.session_state.messages = [
-        {"role": "assistant", "content": "您好！我是智能旅游规划助手🗺️\n\n我可以帮您：\n- 📍 查询景点攻略和美食推荐\n- 🚆 查询火车票和航班信息\n- 🏨 推荐酒店和住宿\n- ☀️ 查询天气预报\n- 🗓️ 查询黄历吉日\n- 🚗 规划自驾路线\n\n请告诉我您的旅行需求吧！"}
-    ]
-
-# 显示历史消息
-for msg in st.session_state.messages:
-    with st.chat_message(msg["role"]):
-        st.markdown(msg["content"])
-
-
-# 创建聊天历史管理
-msgs = StreamlitChatMessageHistory()
-memory = ConversationBufferMemory(
-    chat_memory=msgs,
-    return_messages=True,
-    memory_key="chat_history",
-    output_key="output"
+submitted_query = st.chat_input(
+    "描述出发地、目的地、日期、预算和偏好",
+    disabled=not backend_available,
+    submit_mode="disable",
+    max_chars=4000,
 )
+query = st.session_state.pop("pending_prompt", None) or submitted_query
 
-
-# ReAct Prompt模板
-current_date = datetime.now().strftime("%Y-%m-%d")
-current_year = datetime.now().year
-
-instructions = f"""你是一个专业的旅游规划助手。当前日期是{current_date}。
-
-**完整旅行规划必须包含以下信息，请按顺序调用相应工具：**
-
-1. **交通信息**：
-   - 调用 train_query 查询火车票（必须）
-   - 如果火车不便，调用 gaode_driving 查询自驾路线
-   - 长途（>800km）可调用 flight_query 查询航班
-
-2. **天气预报**：
-   - 对每个目的地城市调用 gaode_weather 查询天气（必须）
-   - 例如去徐州和青岛，需要分别查询两个城市的天气
-
-3. **住宿推荐**：
-   - 调用 gaode_hotel_search 搜索酒店（必须）
-   - 根据预算选择关键词：预算紧张用"经济型酒店"，预算充足用"酒店"
-
-4. **黄历吉日**：
-   - 调用 lucky_day 查询出发日期的黄历信息
-
-5. **复杂行程优化**（多城市、多段行程）：
-   - 调用 r1_analysis 进行深度路线优化
-
-**重要规则：**
-- 日期必须使用{current_year}年，例如"{current_year}-12-18"
-- 每个工具可以针对不同参数调用多次（如查询多个城市的天气）
-- 用中文回答，提供详细的行程规划
-"""
-
-base_prompt_template = """
-{instructions}
-
-TOOLS:
-------
-You have access to the following tools:
-{tools}
-
-To use a tool, you MUST strictly follow this EXACT format:
-
-Thought: Do I need to use a tool? Yes
-Action: the action to take, must be one of [{tool_names}]
-Action Input: the input to the action
-Observation: the result of the action
-
-When you have a response to say to the Human, or if you do not need to use a tool, you MUST strictly follow this EXACT format:
-
-Thought: Do I need to use a tool? No
-Final Answer: [your response here]
-
-CRITICAL RULES:
-1. For complete travel planning, you MUST call: train_query, gaode_weather (for each destination), gaode_hotel_search, lucky_day
-2. You CAN call the same tool multiple times with DIFFERENT parameters (e.g. weather for different cities)
-3. NEVER call the same tool with the SAME parameters twice
-4. If a tool returns an error, explain the error to the user and move on
-5. For multi-city complex trips, call r1_analysis to optimize the route
-6. Use Chinese to respond to users
-7. Provide detailed and complete travel plans
-
-Begin!
-
-Previous conversation history:
-{chat_history}
-
-New input: {input}
-{agent_scratchpad}"""
-
-# 创建Prompt
-base_prompt = PromptTemplate.from_template(base_prompt_template)
-prompt = base_prompt.partial(instructions=instructions)
-
-
-# 创建LLM（使用Qwen3）
-@st.cache_resource
-def get_llm():
-    return ChatOpenAI(
-        model="qwen-plus",
-        openai_api_key=os.getenv("DASHSCOPE_API_KEY"),
-        openai_api_base="https://dashscope.aliyuncs.com/compatible-mode/v1",
-        temperature=0.7
-    )
-
-llm = get_llm()
-
-
-# 创建ReAct Agent
-agent = create_react_agent(llm, tools, prompt)
-
-# 创建Agent执行器
-agent_executor = AgentExecutor(
-    agent=agent,
-    tools=tools,
-    memory=memory,
-    verbose=False,  # 关闭详细日志，避免UI显示调试信息
-    handle_parsing_errors=True,
-    max_iterations=max_iterations
-)
-
-
-# 聊天输入框
-if user_query := st.chat_input(placeholder="请输入您的旅行需求，例如：我想12月去杭州玩3天"):
-    # 添加用户消息
-    st.session_state.messages.append({"role": "user", "content": user_query})
-    
-    # 显示用户消息
+if query:
+    user_message = {"role": "user", "content": query}
+    st.session_state.messages.append(user_message)
     with st.chat_message("user"):
-        st.markdown(user_query)
-    
-    # 显示助手响应
+        st.markdown(query)
+
     with st.chat_message("assistant"):
-        # 配置回调（空配置，不显示执行过程）
-        config = {}
-        
-        # ========== 预分析层：判断场景类型 ==========
-        with st.spinner("🔍 正在分析您的旅行需求..."):
-            pre_analysis = pre_analyze_query(user_query, llm)
-        
-        scenario_type = pre_analysis['scenario_type']
-        needs_r1 = pre_analysis['needs_deep_analysis']
-        extraction = pre_analysis['extraction']
-        
-        # 显示场景类型提示（隐藏技术细节）
-        if scenario_type == 'multi_destination':
-            st.info("🌍 检测到多目的地行程，将调用深度路线优化...")
-        elif scenario_type == 'complex':
-            st.info("🧠 检测到复杂场景（特殊需求/预算紧张），将进行深度分析...")
-        else:
-            st.info("✅ 正在为您规划旅行...")
-        
-        # ========== 根据场景类型选择不同的处理路径 ==========
-        with st.spinner("正在规划您的旅行..."):
+        with st.status("正在检索资料和实时信息...", expanded=False) as status:
             try:
-                if needs_r1:
-                    # 复杂场景 / 多目的地：R1 主导
-                    # 先调用 R1 进行深度分析和规划
-                    print(f"\n🧠 R1 主导模式: {scenario_type}")
-                    
-                    # 构建增强的输入，强制 Agent 先调用 r1_analysis
-                    enhanced_input = f"""用户查询: {user_query}
-
-ℹ️ **重要提示**：系统检测到这是一个{'多目的地' if scenario_type == 'multi_destination' else '复杂'}场景。
-
-请按以下顺序处理：
-1. **首先调用 r1_analysis** 进行深度路线规划和优化，输入应包含完整的用户需求
-2. 然后根据 R1 的建议，调用其他工具查询具体信息（火车票、天气、酒店等）
-3. 最后综合所有信息生成完整的旅行规划
-
-已提取的信息：
-- 目的地: {extraction.get('destination', '未知')}
-- 出发地: {extraction.get('origin', '未知')}
-- 旅行天数: {extraction.get('travel_days', 0)}
-- 预算: {extraction.get('budget', 0)}元
-- 出发日期: {extraction.get('travel_date', '未知')}
-- 偏好: {extraction.get('preferences', [])}
-"""
-                    response = agent_executor.invoke({"input": enhanced_input}, config=config)
-                else:
-                    # 简单场景：Qwen3 主导
-                    print(f"\n✅ Qwen3 主导模式: {scenario_type}")
-                    response = agent_executor.invoke({"input": user_query}, config=config)
-                
-                # 提取回答
-                answer = response.get("output", "抱歉，我无法生成回答。")
-                
-                # 添加助手消息
-                st.session_state.messages.append({"role": "assistant", "content": answer})
-                
-                # 显示回答
-                st.markdown(answer)
-                
-            except Exception as e:
-                error_msg = f"抱歉，处理您的请求时出现错误：{str(e)}"
-                st.error(error_msg)
-                st.session_state.messages.append({"role": "assistant", "content": error_msg})
-
-
-# 侧边栏 - 显示当前配置
-with st.sidebar:
-    st.markdown("---")
-    st.header("📊 当前配置")
-    st.write(f"- 知识库文档: {len(knowledge_stats['sources'])}")
-    st.write(f"- 知识库分块: {knowledge_stats['total']}")
-    st.write(f"- 工具数量: {len(tools)}")
-    st.write(f"- 最大迭代: {max_iterations}")
-    st.write(f"- 对话轮数: {len(st.session_state.messages)}")
+                response = client.chat(
+                    query=query,
+                    client_id=st.session_state.client_id,
+                    conversation_id=st.session_state.conversation_id,
+                )
+                st.session_state.conversation_id = response["conversation_id"]
+                st.session_state.loaded_conversation_id = response["conversation_id"]
+                assistant_message = {
+                    "role": "assistant",
+                    "content": response["answer"],
+                    "citations": response.get("citations", []),
+                    "tools": response.get("tools", []),
+                }
+                st.session_state.messages.append(assistant_message)
+                status.update(label="规划完成", state="complete")
+                st.markdown(response["answer"])
+            except httpx.HTTPStatusError as exc:
+                detail = exc.response.json().get("detail", str(exc))
+                status.update(label="规划失败", state="error")
+                st.error(detail)
+            except httpx.HTTPError as exc:
+                status.update(label="后端连接失败", state="error")
+                st.error(str(exc))

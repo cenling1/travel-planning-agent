@@ -167,6 +167,16 @@ cython_debug/
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 .idea/
 
+# Local runtime data
+tmp/
+aggentic_RAG/data/travel_agent.db*
+aggentic_RAG/data/uploads/
+aggentic_RAG/data/travel_vectordb/
+aggentic_RAG/travel_agent/config/servers_config.json
+
+# Streamlit secrets
+.streamlit/secrets.toml
+
 # Ruff stuff:
 .ruff_cache/
 

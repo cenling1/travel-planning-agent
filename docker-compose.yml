@@ -1,0 +1,49 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_DB: travel_agent
+      POSTGRES_USER: travel_agent
+      POSTGRES_PASSWORD: travel_agent
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U travel_agent -d travel_agent"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+
+  backend:
+    build: .
+    command: >
+      sh -c "alembic upgrade head &&
+      uvicorn backend.main:app --host 0.0.0.0 --port 8000"
+    environment:
+      DATABASE_URL: postgresql+psycopg://travel_agent:travel_agent@postgres:5432/travel_agent
+      UPLOAD_DIR: /data/uploads
+      MCP_CONFIG_PATH: travel_agent/config/servers_config.json
+      DASHSCOPE_API_KEY: ${DASHSCOPE_API_KEY:-}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - uploads_data:/data/uploads
+    ports:
+      - "8000:8000"
+
+  frontend:
+    build: .
+    command: streamlit run app.py --server.address 0.0.0.0 --server.port 8501
+    environment:
+      BACKEND_URL: http://backend:8000
+    depends_on:
+      - backend
+    ports:
+      - "8501:8501"
+
+volumes:
+  postgres_data:
+  uploads_data:

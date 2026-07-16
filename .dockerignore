@@ -1,0 +1,9 @@
+.git
+.idea
+.venv
+__pycache__
+*.pyc
+.env
+aggentic_RAG/data/travel_agent.db*
+aggentic_RAG/data/uploads
+aggentic_RAG/data/travel_vectordb

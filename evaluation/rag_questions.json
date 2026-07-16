@@ -1,0 +1,32 @@
+[
+  {
+    "query": "成都看熊猫建议几点去？",
+    "expected_sources": ["chengdu.md"],
+    "expected_terms": ["8-10点", "熊猫"]
+  },
+  {
+    "query": "成都春熙路附近住宿大概多少钱？",
+    "expected_sources": ["chengdu.md"],
+    "expected_terms": ["200-500", "春熙路"]
+  },
+  {
+    "query": "故宫门票和建议游玩时间是多少？",
+    "expected_sources": ["beijing.md"],
+    "expected_terms": ["60元", "4-5小时"]
+  },
+  {
+    "query": "从北京市区怎么去八达岭长城？",
+    "expected_sources": ["beijing.md"],
+    "expected_terms": ["877路", "1.5小时"]
+  },
+  {
+    "query": "上海外滩什么时候适合拍照？",
+    "expected_sources": ["shanghai.md"],
+    "expected_terms": ["晚上", "灯光"]
+  },
+  {
+    "query": "上海有哪些本地小吃？",
+    "expected_sources": ["shanghai.md"],
+    "expected_terms": ["生煎包", "小笼包"]
+  }
+]

@@ -3,18 +3,6 @@
         {
             "name": "12306 Server",
             "url": "https://your-12306-mcp-endpoint"
-        },
-        {
-            "name": "Gaode Server",
-            "url": "https://your-gaode-mcp-endpoint"
-        },
-        {
-            "name": "bazi Server",
-            "url": "https://your-bazi-mcp-endpoint"
-        },
-        {
-            "name": "flight Server",
-            "url": "https://your-flight-mcp-endpoint"
         }
     ]
 }

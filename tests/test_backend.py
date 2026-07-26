@@ -1,14 +1,17 @@
 import asyncio
+from datetime import datetime, timedelta
+import json
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
 from backend.config import Settings
 from backend.database import Base
+from backend.integrations.mcp import MCPToolManager
 from backend.repositories.conversations import ConversationRepository
 from backend.schemas import ToolResult, TravelRequest
 from backend.services.agent_service import TravelAgentService
@@ -207,46 +210,199 @@ class BackendServiceTests(unittest.TestCase):
         self.assertEqual(extraction["destination"], "\u4e0a\u6d77")
         self.assertIn("train", extraction["tool_intents"])
 
-    def test_weather_query_recovers_from_incorrect_casual_extraction(self):
+    def test_train_query_recognizes_current_location_phrase(self):
         service = TravelAgentService(self.database, self.settings)
 
         extraction = service._normalize_extraction(
-            "上海天气怎么样",
-            {
-                "intent": "casual",
-                "destination": "",
-                "needs_rag": False,
-                "tool_intents": [],
-            },
+            "\u6211\u60f3\u53bb\u4e0a\u6d77\u73a9\u4e09\u5929\uff0c\u6211\u73b0\u5728\u5728\u5a04\u5e95\uff0c\u660e\u5929\u4e0b\u5348\u51fa\u53d1\uff0c\u6211\u8981\u5750\u9ad8\u94c1\u53bb",
+            {},
         )
 
-        self.assertEqual(extraction["intent"], "travel_question")
-        self.assertEqual(extraction["destination"], "上海")
-        self.assertEqual(extraction["tool_intents"], ["weather"])
-        self.assertFalse(extraction["needs_rag"])
+        self.assertEqual(extraction["origin"], "\u5a04\u5e95")
+        self.assertEqual(extraction["destination"], "\u4e0a\u6d77")
+        self.assertEqual(
+            extraction["travel_date"],
+            (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d"),
+        )
+        self.assertIn("train", extraction["tool_intents"])
+        self.assertFalse(service._is_complete_realtime_request(extraction))
 
-    def test_complete_weather_query_skips_model_extraction(self):
+    def test_direct_train_query_returns_realtime_result_without_planning(self):
+        service = TravelAgentService(self.database, self.settings)
+
+        extraction = service._normalize_extraction(
+            "\u67e5\u8be2\u660e\u5929\u5e7f\u5dde\u5230\u4e0a\u6d77\u7684\u9ad8\u94c1\u7968",
+            {},
+        )
+
+        self.assertEqual(extraction["travel_days"], 0)
+        self.assertTrue(service._is_complete_realtime_request(extraction))
+
+    def test_complete_planning_query_uses_model_preanalysis(self):
         service = TravelAgentService(self.database, self.settings)
         service.llm = AsyncMock()
-
-        extraction = asyncio.run(service._extract("上海天气怎么样"))
-
-        service.llm.ainvoke.assert_not_awaited()
-        self.assertEqual(extraction["destination"], "上海")
-        self.assertEqual(extraction["tool_intents"], ["weather"])
-
-    def test_complete_planning_query_skips_model_extraction(self):
-        service = TravelAgentService(self.database, self.settings)
-        service.llm = AsyncMock()
+        service.llm.ainvoke.return_value = MagicMock(
+            content=(
+                '{"intent":"travel_plan","destination":"上海","origin":"娄底",'
+                '"travel_days":3,"travel_date":"2026-07-28","tool_intents":["train"]}'
+            )
+        )
 
         extraction = asyncio.run(
             service._extract("我想去上海玩三天，明天出发，我在娄底")
         )
 
-        service.llm.ainvoke.assert_not_awaited()
+        service.llm.ainvoke.assert_awaited_once()
         self.assertEqual(extraction["destination"], "上海")
         self.assertEqual(extraction["origin"], "娄底")
         self.assertEqual(extraction["travel_days"], 3)
+
+    def test_agent_planner_selects_tools_for_complete_trip(self):
+        service = TravelAgentService(self.database, self.settings)
+        service.llm = AsyncMock()
+        service.knowledge.search = AsyncMock(return_value=[])
+        service.llm.ainvoke.return_value = MagicMock(
+            content=json.dumps(
+                {
+                    "calls": [
+                        {
+                            "tool": "knowledge_search",
+                            "arguments": {"query": "上海三日游景点住宿美食"},
+                        },
+                        {
+                            "tool": "train_query",
+                            "arguments": {
+                                "origin": "娄底",
+                                "destination": "上海",
+                                "date": "2026-07-28",
+                                "train_type": "G",
+                            },
+                        },
+                    ],
+                    "done": True,
+                },
+                ensure_ascii=False,
+            )
+        )
+        extraction = service._normalize_extraction(
+            "我想去上海玩三天，我目前在娄底，明天下午出发，我要坐高铁去",
+            {},
+        )
+
+        with patch(
+            "backend.services.agent_tools.mcp_travel_service.query_train",
+            new=AsyncMock(
+                return_value=ToolResult(
+                    name="get-tickets",
+                    success=True,
+                    content="G1",
+                )
+            ),
+        ):
+            citations, tools = asyncio.run(
+                service._collect_context(
+                    TravelRequest(query="完整旅行规划", client_id="agent-client"),
+                    extraction,
+                )
+            )
+
+        self.assertEqual(citations, [])
+        self.assertEqual({tool.name for tool in tools}, {"get-tickets"})
+        service.llm.ainvoke.assert_awaited_once()
+
+    def test_agent_planner_failure_falls_back_to_deterministic_collection(self):
+        service = TravelAgentService(self.database, self.settings)
+        service.llm = AsyncMock()
+        service.llm.ainvoke.return_value = MagicMock(content="not-json")
+        service.knowledge.search = AsyncMock(return_value=[])
+        extraction = service._normalize_extraction(
+            "查询明天广州到上海的高铁票",
+            {},
+        )
+
+        with patch(
+            "backend.services.agent_service.mcp_travel_service.collect",
+            new=AsyncMock(return_value=[]),
+        ) as collect_tools:
+            citations, tools = asyncio.run(
+                service._collect_context(
+                    TravelRequest(query="查询明天广州到上海的高铁票", client_id="fallback"),
+                    extraction,
+                )
+            )
+
+        self.assertEqual(citations, [])
+        self.assertEqual(tools, [])
+        collect_tools.assert_awaited_once()
+
+    def test_agent_planner_can_add_tools_after_observation(self):
+        service = TravelAgentService(self.database, self.settings)
+        service.llm = AsyncMock()
+        service.knowledge.search = AsyncMock(return_value=[])
+        service.llm.ainvoke.side_effect = [
+            MagicMock(
+                content=json.dumps(
+                    {
+                        "calls": [
+                            {
+                                "tool": "knowledge_search",
+                                "arguments": {"query": "上海三日游攻略"},
+                            }
+                        ],
+                        "done": False,
+                    },
+                    ensure_ascii=False,
+                )
+            ),
+            MagicMock(
+                content=json.dumps(
+                    {
+                        "calls": [
+                            {
+                                "tool": "train_query",
+                                "arguments": {
+                                    "origin": "娄底",
+                                    "destination": "上海",
+                                    "date": "2026-07-28",
+                                    "train_type": "G",
+                                },
+                            }
+                        ],
+                        "done": True,
+                    },
+                    ensure_ascii=False,
+                )
+            ),
+        ]
+        extraction = service._normalize_extraction(
+            "我想去上海玩三天，我目前在娄底，明天坐高铁出发",
+            {},
+        )
+
+        with patch(
+            "backend.services.agent_tools.mcp_travel_service.query_train",
+            new=AsyncMock(
+                return_value=ToolResult(
+                    name="get-tickets",
+                    success=True,
+                    content="G1-result",
+                )
+            ),
+        ):
+            _, tools = asyncio.run(
+                service._collect_context(
+                    TravelRequest(
+                        query="我想去上海玩三天，我目前在娄底，明天坐高铁出发",
+                        client_id="agent-follow-up",
+                    ),
+                    extraction,
+                )
+            )
+
+        self.assertEqual(len(tools), 1)
+        self.assertEqual(service.llm.ainvoke.await_count, 2)
+        second_prompt = service.llm.ainvoke.await_args_list[1].args[0]
+        self.assertIn("知识库没有检索到相关资料", second_prompt)
 
     def test_chat_stream_emits_progress_content_and_completion(self):
         service = TravelAgentService(self.database, self.settings)
@@ -299,7 +455,14 @@ class BackendServiceTests(unittest.TestCase):
             return_value="Error: Cannot read properties of undefined"
         )
 
-        result = asyncio.run(service.call("Gaode Server", "maps_weather", city="上海"))
+        result = asyncio.run(
+            service.call(
+                "12306 Server",
+                "get-tickets",
+                fromStation="GZQ",
+                toStation="SHH",
+            )
+        )
 
         self.assertFalse(result.success)
 
@@ -346,25 +509,6 @@ class BackendServiceTests(unittest.TestCase):
 
         self.assertIn("G246", answer)
 
-    def test_realtime_answer_formats_weather_without_model(self):
-        service = TravelAgentService(self.database, self.settings)
-        tools = [
-            ToolResult(
-                name="maps_weather",
-                success=True,
-                content=(
-                    '{"city":"上海市","forecasts":['
-                    '{"date":"2026-07-25","dayweather":"晴","nightweather":"多云",'
-                    '"daytemp":"36","nighttemp":"29"}]}'
-                ),
-            )
-        ]
-
-        answer = service._realtime_answer(tools)
-
-        self.assertIn("上海市天气", answer)
-        self.assertIn("36°C", answer)
-
     def test_mcp_collect_skips_initialization_without_required_arguments(self):
         service = MCPTravelService()
 
@@ -374,9 +518,9 @@ class BackendServiceTests(unittest.TestCase):
                     {
                         "destination": "上海",
                         "travel_date": "2026-08-10",
-                        "tool_intents": ["flight"],
+                        "tool_intents": [],
                     },
-                    "帮我查去上海的航班",
+                    "帮我规划去上海的行程",
                 )
             )
 
@@ -394,10 +538,12 @@ class BackendServiceTests(unittest.TestCase):
             result = asyncio.run(
                 service.collect(
                     {
+                        "origin": "广州",
                         "destination": "上海",
-                        "tool_intents": ["weather"],
+                        "travel_date": "2026-08-10",
+                        "tool_intents": ["train"],
                     },
-                    "上海天气怎么样",
+                    "查询广州到上海的高铁",
                 )
             )
 
@@ -405,6 +551,26 @@ class BackendServiceTests(unittest.TestCase):
         self.assertFalse(result[0].success)
         self.assertEqual(result[0].name, "realtime-tools")
         self.assertNotIn("private config", result[0].content)
+
+    def test_travel_mcp_service_only_loads_12306_server(self):
+        config_path = Path(self.temp_dir.name) / "servers_config.json"
+        config_path.write_text(
+            json.dumps(
+                {
+                    "mcp_servers": [
+                        {"name": "12306 Server", "url": "https://example.com/train"},
+                        {"name": "Unsupported Server", "url": "https://example.com/other"},
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        service = MCPTravelService()
+        service.manager = MCPToolManager(str(config_path))
+
+        asyncio.run(service.initialize())
+
+        self.assertEqual(set(service.manager.servers), {"12306 Server"})
 
     def test_mcp_health_reports_no_tools_when_config_is_missing(self):
         service = MCPTravelService()

@@ -37,7 +37,7 @@ openssl rand -hex 32
 
 4. 设置首次管理员的 `BOOTSTRAP_ADMIN_USERNAME` 和 `BOOTSTRAP_ADMIN_PASSWORD`。密码至少 10 位，并包含大写字母、小写字母、数字、特殊字符中的三类。
 5. 决定是否开放自助注册。生产模板默认设置 `AUTH_REGISTRATION_ENABLED=false`，由管理员在界面中创建账号；确需公开注册时再显式开启。
-6. 填写 DeepSeek、DashScope 等模型配置。
+6. 填写 DeepSeek、DashScope 等模型配置。`AGENT_MAX_ROUNDS` 控制工具规划轮数，`AGENT_MAX_TOOL_CALLS` 限制单次请求最多执行的工具数量。
 7. 将私有 MCP 配置放到 `MCP_CONFIG_HOST_PATH` 指向的位置，并限制为部署用户只读。
 
 不要提交 `.env`、MCP 配置、数据库、上传文件、访问令牌或备份文件。`JWT_SECRET` 变更后，所有现有登录会话会立即失效。
@@ -99,6 +99,6 @@ bash scripts/backup.sh
 - A 用户上传的文档、会话和记忆，B 用户不可见，即使 B 伪造 `client_id` 也不可见。
 - 修改密码或停用账号后，原访问令牌和刷新令牌均不可继续使用。
 - `/health` 正常，且不泄露私有 MCP 地址或密钥。
-- “你好”快速返回，不触发知识库或 MCP；天气和 12306 失败时不伪造结果。
+- “你好”快速返回，不触发知识库或 MCP；12306 失败时不伪造车次结果。
 - 重启容器后，账号、会话、文档和记忆不丢失。
 - 公网无法访问 `5432`、`8000`，重复请求可触发 429 限流。

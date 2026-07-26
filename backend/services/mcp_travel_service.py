@@ -7,6 +7,8 @@ from typing import Any
 from ..integrations.mcp import MCPToolManager
 from ..schemas import ToolResult
 
+ENABLED_TRAVEL_MCP_SERVERS = {"12306 Server"}
+
 
 def _json_value(value: str) -> Any:
     try:
@@ -37,6 +39,14 @@ class MCPTravelService:
         async with self._initialize_lock:
             if not self._initialized:
                 await self.manager.initialize()
+                disabled_servers = [
+                    name
+                    for name in self.manager.servers
+                    if name not in ENABLED_TRAVEL_MCP_SERVERS
+                ]
+                for name in disabled_servers:
+                    connection = self.manager.servers.pop(name)
+                    await connection.close()
                 self._initialized = True
 
     async def call(self, server: str, tool: str, **arguments) -> ToolResult:
@@ -69,21 +79,9 @@ class MCPTravelService:
         ]
         origin = str(extraction.get("origin", "")).strip()
         travel_date = str(extraction.get("travel_date", "")).strip()
-        travel_days = int(extraction.get("travel_days") or 0)
         tool_intents = set(extraction.get("tool_intents") or [])
 
-        may_call_tools = (
-            destinations
-            and tool_intents.intersection({"weather", "attractions", "hotel"})
-        ) or (
-            origin
-            and destinations
-            and (
-                "train" in tool_intents
-                or (travel_date and "flight" in tool_intents)
-            )
-        ) or (travel_date and "calendar" in tool_intents)
-        if not may_call_tools:
+        if "train" not in tool_intents or not origin or not destinations:
             return []
 
         try:
@@ -97,77 +95,22 @@ class MCPTravelService:
                 )
             ]
 
-        tasks = []
-        for city in destinations[:2]:
-            if "Gaode Server" in self.manager.servers:
-                if "weather" in tool_intents:
-                    tasks.append(self.call("Gaode Server", "maps_weather", city=city))
-                if "attractions" in tool_intents:
-                    tasks.append(
-                        self.call(
-                            "Gaode Server",
-                            "maps_text_search",
-                            keywords=f"{city} 景点",
-                            city=city,
-                        )
-                    )
-                if "hotel" in tool_intents and (
-                    travel_days > 1 or any(word in query for word in ("酒店", "住宿", "民宿"))
-                ):
-                    tasks.append(
-                        self.call(
-                            "Gaode Server",
-                            "maps_text_search",
-                            keywords=f"{city} 酒店",
-                            city=city,
-                        )
-                    )
-
-        if (
-            "train" in tool_intents
-            and origin
-            and destinations
-            and "12306 Server" in self.manager.servers
-        ):
-            train_filter_flags = ""
-            if "高铁" in query:
-                train_filter_flags = "G"
-            elif "动车" in query:
-                train_filter_flags = "D"
-            tasks.append(
-                self.query_train(
-                    origin,
-                    destinations[0],
-                    travel_date,
-                    train_filter_flags=train_filter_flags,
-                )
-            )
-
-        if travel_date and "calendar" in tool_intents:
-            if "bazi Server" in self.manager.servers:
-                tasks.append(
-                    self.call(
-                        "bazi Server",
-                        "getChineseCalendar",
-                        solarDatetime=f"{travel_date}T12:00:00+08:00",
-                    )
-                )
-
-        if destinations and travel_date and "flight" in tool_intents:
-            if "flight Server" in self.manager.servers:
-                tasks.append(
-                    self.call(
-                        "flight Server",
-                        "searchFlightsByDepArr",
-                        dep=origin,
-                        arr=destinations[0],
-                        date=travel_date,
-                    )
-                )
-
-        if not tasks:
+        if "12306 Server" not in self.manager.servers:
             return []
-        return list(await asyncio.gather(*tasks))
+
+        train_filter_flags = ""
+        if "高铁" in query:
+            train_filter_flags = "G"
+        elif "动车" in query:
+            train_filter_flags = "D"
+        return [
+            await self.query_train(
+                origin,
+                destinations[0],
+                travel_date,
+                train_filter_flags=train_filter_flags,
+            )
+        ]
 
     async def query_train(
         self,

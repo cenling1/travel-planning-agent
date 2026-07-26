@@ -49,6 +49,8 @@ class Settings:
     )
     rag_timeout_seconds: float = float(os.getenv("RAG_TIMEOUT_SECONDS", "12"))
     mcp_timeout_seconds: float = float(os.getenv("MCP_TIMEOUT_SECONDS", "30"))
+    agent_max_rounds: int = int(os.getenv("AGENT_MAX_ROUNDS", "3"))
+    agent_max_tool_calls: int = int(os.getenv("AGENT_MAX_TOOL_CALLS", "12"))
     embedding_model: str = os.getenv("EMBEDDING_MODEL", "text-embedding-v4")
     embedding_dimension: int = int(os.getenv("EMBEDDING_DIMENSION", "1024"))
     chunk_size: int = int(os.getenv("RAG_CHUNK_SIZE", "500"))

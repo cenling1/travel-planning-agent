@@ -13,6 +13,7 @@ from ..config import Settings, get_settings
 from ..integrations.reasoning import DeepSeekR1Analyzer
 from ..repositories.conversations import ConversationRepository
 from ..schemas import Citation, ToolResult, TravelRequest, TravelResponse, TripSummary
+from .agent_tools import AGENT_TOOL_NAMES, TravelToolExecutor, tool_catalog
 from .knowledge_service import KnowledgeService
 from .memory_service import MemoryService
 from .mcp_travel_service import mcp_travel_service
@@ -126,6 +127,17 @@ class TravelAgentService:
         request: TravelRequest,
         extraction: dict,
     ) -> tuple[list[Citation], list[ToolResult]]:
+        if self.llm and extraction.get("intent") != "casual":
+            agent_context = await self._collect_context_with_agent(request, extraction)
+            if agent_context is not None:
+                return agent_context
+        return await self._collect_context_fallback(request, extraction)
+
+    async def _collect_context_fallback(
+        self,
+        request: TravelRequest,
+        extraction: dict,
+    ) -> tuple[list[Citation], list[ToolResult]]:
         citations: list[Citation] = []
         tool_results: list[ToolResult] = []
         search_task = (
@@ -144,6 +156,156 @@ class TravelAgentService:
             citations = await search_task
         elif tools_task:
             tool_results = await tools_task
+        return citations, tool_results
+
+    async def _collect_context_with_agent(
+        self,
+        request: TravelRequest,
+        extraction: dict,
+    ) -> tuple[list[Citation], list[ToolResult]] | None:
+        executor = TravelToolExecutor(
+            knowledge=self.knowledge,
+            owner_id=request.client_id,
+            default_query=request.query,
+        )
+        observations: list[dict[str, Any]] = []
+        citations_by_chunk: dict[str, Citation] = {}
+        tool_results: list[ToolResult] = []
+        executed_calls: set[str] = set()
+
+        for round_index in range(max(1, self.settings.agent_max_rounds)):
+            try:
+                calls, done = await asyncio.wait_for(
+                    self._plan_agent_tools(
+                        request.query,
+                        extraction,
+                        observations,
+                        executed_calls,
+                        round_index,
+                    ),
+                    timeout=self.settings.llm_extraction_timeout_seconds,
+                )
+            except Exception:
+                return None if not executed_calls else self._finalize_agent_context(
+                    citations_by_chunk,
+                    tool_results,
+                )
+
+            pending_calls: list[tuple[str, dict[str, Any], str]] = []
+            for call in calls:
+                tool_name = str(call.get("tool") or "").strip()
+                arguments = call.get("arguments") or {}
+                if tool_name not in AGENT_TOOL_NAMES or not isinstance(arguments, dict):
+                    continue
+                call_key = json.dumps(
+                    [tool_name, arguments],
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    default=str,
+                )
+                if call_key in executed_calls:
+                    continue
+                pending_calls.append((tool_name, arguments, call_key))
+                if len(executed_calls) + len(pending_calls) >= self.settings.agent_max_tool_calls:
+                    break
+
+            if pending_calls:
+                outcomes = await asyncio.gather(
+                    *(executor.execute(tool_name, arguments) for tool_name, arguments, _ in pending_calls)
+                )
+                for (tool_name, arguments, call_key), outcome in zip(pending_calls, outcomes):
+                    executed_calls.add(call_key)
+                    observations.append(
+                        {
+                            "tool": tool_name,
+                            "arguments": arguments,
+                            "observation": outcome.observation[:4000],
+                        }
+                    )
+                    for citation in outcome.citations:
+                        citations_by_chunk[citation.chunk_id] = citation
+                    if outcome.result is not None:
+                        tool_results.append(outcome.result)
+
+            if done or not pending_calls or len(executed_calls) >= self.settings.agent_max_tool_calls:
+                break
+
+        if not executed_calls:
+            return None
+        return self._finalize_agent_context(citations_by_chunk, tool_results)
+
+    async def _plan_agent_tools(
+        self,
+        query: str,
+        extraction: dict,
+        observations: list[dict[str, Any]],
+        executed_calls: set[str],
+        round_index: int,
+    ) -> tuple[list[dict[str, Any]], bool]:
+        prompt = f"""你是旅行 Agent 的工具规划器，负责根据用户真实需求自主选择工具。
+当前日期：{datetime.now():%Y-%m-%d}
+
+工作方式类似 ReAct：先查看需求和已有 Observation，再决定下一批 Action。
+完整旅行规划可组合知识库与 12306 车次结果；景点、住宿、美食等内容优先检索知识库。
+目前唯一的实时外部工具是 12306，天气、航班等信息不要尝试调用不存在的工具。
+不要调用缺少必要参数的工具，不要重复相同工具和相同参数。
+工具失败时可选择替代工具或结束，禁止虚构工具结果。
+
+可用工具：
+{json.dumps(tool_catalog(), ensure_ascii=False)}
+
+结构化需求：
+{json.dumps(extraction, ensure_ascii=False)}
+
+用户原始需求：
+{query}
+
+已完成调用：{len(executed_calls)}
+当前轮次：{round_index + 1}
+已有 Observation：
+{json.dumps(observations[-8:], ensure_ascii=False)}
+
+只输出一个JSON对象，不要Markdown：
+{{"calls":[{{"tool":"工具名","arguments":{{}}}}],"done":false}}
+
+说明：
+- calls 可包含多个互不依赖的工具，以便并发执行。
+- 仍需根据结果补充工具时 done=false。
+- 信息已经足够生成最终回答时 calls=[] 且 done=true。
+"""
+        response = await self.llm.ainvoke(prompt)
+        content = self._json_content(response.content)
+        calls = content.get("calls") or []
+        if not isinstance(calls, list):
+            raise TypeError("Agent calls must be a list")
+        return calls, bool(content.get("done"))
+
+    @staticmethod
+    def _json_content(content: Any) -> dict[str, Any]:
+        text = str(content or "").strip()
+        if text.startswith("```"):
+            text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.IGNORECASE)
+        try:
+            value = json.loads(text)
+        except json.JSONDecodeError:
+            start = text.find("{")
+            end = text.rfind("}")
+            if start < 0 or end <= start:
+                raise
+            value = json.loads(text[start:end + 1])
+        if not isinstance(value, dict):
+            raise TypeError("Agent response must be a JSON object")
+        return value
+
+    @staticmethod
+    def _finalize_agent_context(
+        citations_by_chunk: dict[str, Citation],
+        tool_results: list[ToolResult],
+    ) -> tuple[list[Citation], list[ToolResult]]:
+        citations = [
+            citation.model_copy(update={"index": index})
+            for index, citation in enumerate(citations_by_chunk.values(), start=1)
+        ]
         return citations, tool_results
 
     async def _search_with_timeout(self, client_id: str, query: str) -> list[Citation]:
@@ -225,12 +387,11 @@ class TravelAgentService:
 
         prompt = f"""今天是 {datetime.now():%Y-%m-%d}。从旅行需求中提取信息。
 只输出JSON，不要Markdown：
-{{"intent":"casual|travel_plan|travel_question","destination":"多个城市用逗号分隔","origin":"","travel_days":0,"travelers":0,"budget":0,"travel_date":"YYYY-MM-DD","preferences":[],"has_special_needs":false,"needs_rag":true,"tool_intents":["weather","attractions","hotel","train","calendar","flight"]}}
+{{"intent":"casual|travel_plan|travel_question","destination":"多个城市用逗号分隔","origin":"","travel_days":0,"travelers":0,"budget":0,"travel_date":"YYYY-MM-DD","preferences":[],"has_special_needs":false,"needs_rag":true,"tool_intents":["train"]}}
 规则：
 - 闲聊、问候、与旅行无关的问题：intent=casual, needs_rag=false, tool_intents=[]。
-- 只有用户明确需要或规划确实依赖实时信息时才填 tool_intents。
-- 查高铁/火车必须同时有 origin、destination、travel_date；缺少日期时不要填 train。
-- 查航班必须有 origin、destination、travel_date；缺少出发地或日期时不要填 flight。
+- 只有用户明确需要查询火车、高铁、动车或 12306 时才填 train。
+- 查高铁/火车必须同时有 origin、destination；缺少日期时仍填 train，系统会使用当天日期。
         用户需求：{query}"""
         try:
             response = await asyncio.wait_for(
@@ -246,13 +407,7 @@ class TravelAgentService:
     def _can_use_fallback_extraction(self, fallback: dict) -> bool:
         if fallback.get("intent") == "casual":
             return True
-        if self._is_complete_realtime_request(fallback):
-            return True
-        return bool(
-            fallback.get("intent") == "travel_plan"
-            and fallback.get("destination")
-            and (fallback.get("travel_days") or fallback.get("travel_date"))
-        )
+        return self._is_complete_realtime_request(fallback)
 
     def _fallback_extract(self, query: str) -> dict:
         days_match = re.search(r"(\d+|[一二三四五六七八九十]+)\s*天", query)
@@ -272,7 +427,8 @@ class TravelAgentService:
             route_query,
         )
         current_location_match = re.search(
-            r"(?:我在|人在|目前在)\s*([^，,。\s]+?)(?:，|,|。|\s|出发|$)",
+            r"(?:我(?:现在|目前)?在|人在|现在在|目前在|当前(?:位置)?(?:在|是))\s*"
+            r"([^，,。\s]+?)(?:，|,|。|\s|出发|$)",
             query,
         )
         destination_match = re.search(
@@ -329,8 +485,6 @@ class TravelAgentService:
         tool_intents = self._fallback_tool_intents(query)
         if "train" in tool_intents and not (origin and destination):
             tool_intents.remove("train")
-        if "flight" in tool_intents and not (origin and destination and travel_date):
-            tool_intents.remove("flight")
 
         return {
             "intent": self._fallback_intent(query),
@@ -401,14 +555,6 @@ class TravelAgentService:
             "火车",
             "车票",
             "12306",
-            "航班",
-            "飞机",
-            "机票",
-            "黄历",
-            "吉日",
-            "天气",
-            "气温",
-            "下雨",
         )
         planning_keywords = ("旅行", "旅游", "行程", "攻略", "景点", "酒店", "住宿", "几天", "怎么玩")
         return any(keyword in query for keyword in planning_keywords) or not any(
@@ -417,18 +563,8 @@ class TravelAgentService:
 
     def _fallback_tool_intents(self, query: str) -> list[str]:
         intents: list[str] = []
-        if any(keyword in query for keyword in ("天气", "气温", "下雨")):
-            intents.append("weather")
-        if any(keyword in query for keyword in ("景点", "攻略", "行程", "怎么玩", "旅游", "旅行")):
-            intents.append("attractions")
-        if any(keyword in query for keyword in ("酒店", "住宿", "民宿")):
-            intents.append("hotel")
         if any(keyword in query for keyword in ("高铁", "火车", "车票", "动车", "12306")):
             intents.append("train")
-        if any(keyword in query for keyword in ("黄历", "吉日", "宜出行")):
-            intents.append("calendar")
-        if any(keyword in query for keyword in ("飞机", "航班", "机票")):
-            intents.append("flight")
         return intents
 
     def _normalize_extraction(self, query: str, extraction: dict) -> dict:
@@ -458,7 +594,7 @@ class TravelAgentService:
         extracted_tools = extraction.get("tool_intents") or []
         if isinstance(extracted_tools, str):
             extracted_tools = [item.strip() for item in extracted_tools.split(",") if item.strip()]
-        allowed_tools = {"weather", "attractions", "hotel", "train", "calendar", "flight"}
+        allowed_tools = {"train"}
         normalized_tool_intents = list(
             dict.fromkeys(
                 intent
@@ -468,18 +604,18 @@ class TravelAgentService:
         )
         origin = str(normalized.get("origin", "")).strip()
         destination = str(normalized.get("destination", "")).strip()
-        travel_date = str(normalized.get("travel_date", "")).strip()
+        travel_days = int(normalized.get("travel_days") or 0)
         if "train" in normalized_tool_intents and not (origin and destination):
             normalized_tool_intents.remove("train")
-        if "flight" in normalized_tool_intents and not (origin and destination and travel_date):
-            normalized_tool_intents.remove("flight")
-        if "calendar" in normalized_tool_intents and not travel_date:
-            normalized_tool_intents.remove("calendar")
         normalized["tool_intents"] = normalized_tool_intents
         needs_rag = extraction.get("needs_rag")
         if isinstance(needs_rag, str):
             needs_rag = needs_rag.strip().lower() in {"true", "1", "yes", "是", "需要"}
-        normalized["needs_rag"] = bool(fallback.get("needs_rag") or needs_rag)
+        normalized["needs_rag"] = bool(
+            fallback.get("needs_rag")
+            or needs_rag
+            or (intent == "travel_plan" and destination and travel_days > 0)
+        )
         return normalized
 
     def _should_search_knowledge(self, query: str, extraction: dict) -> bool:
@@ -494,21 +630,14 @@ class TravelAgentService:
 
     def _is_complete_realtime_request(self, extraction: dict) -> bool:
         tool_intents = set(extraction.get("tool_intents") or [])
-        if not tool_intents or tool_intents.intersection({"attractions", "hotel"}):
+        if tool_intents != {"train"}:
+            return False
+        if int(extraction.get("travel_days") or 0) > 0:
             return False
 
         destination = str(extraction.get("destination") or "").strip()
         origin = str(extraction.get("origin") or "").strip()
-        travel_date = str(extraction.get("travel_date") or "").strip()
-        if "weather" in tool_intents and not destination:
-            return False
-        if "train" in tool_intents and not (origin and destination):
-            return False
-        if "flight" in tool_intents and not (origin and destination and travel_date):
-            return False
-        if "calendar" in tool_intents and not travel_date:
-            return False
-        return True
+        return bool(origin and destination)
 
     def _scenario_type(self, query: str, extraction: dict) -> str:
         destination = str(extraction.get("destination", ""))
@@ -702,9 +831,7 @@ class TravelAgentService:
         failed_tools = [tool for tool in tools if not tool.success]
 
         for tool in successful_tools:
-            if tool.name == "maps_weather":
-                lines.extend(self._format_weather_result(tool.content))
-            elif tool.name == "get-tickets":
+            if tool.name == "get-tickets":
                 lines.extend(["\n#### 12306 实时车次", tool.content.strip()])
             else:
                 lines.extend([f"\n#### {tool.name}", tool.content.strip()])
@@ -722,30 +849,6 @@ class TravelAgentService:
             lines.append("实时工具未返回结果，请确认城市、出发地、目的地和日期是否完整。")
         lines.append("\n实时信息可能变化，购票和出发前请再通过官方渠道确认。")
         return "\n".join(lines)
-
-    def _format_weather_result(self, content: str) -> list[str]:
-        try:
-            data = json.loads(content)
-        except json.JSONDecodeError:
-            return ["\n#### 实时天气", content.strip()]
-
-        forecasts = data.get("forecasts") if isinstance(data, dict) else None
-        if not isinstance(forecasts, list):
-            return ["\n#### 实时天气", content.strip()]
-
-        lines = [f"\n#### {data.get('city') or '目的地'}天气"]
-        for forecast in forecasts[:4]:
-            if not isinstance(forecast, dict):
-                continue
-            date = forecast.get("date", "日期未知")
-            day_weather = forecast.get("dayweather", "未知")
-            night_weather = forecast.get("nightweather", "未知")
-            day_temp = forecast.get("daytemp", "未知")
-            night_temp = forecast.get("nighttemp", "未知")
-            lines.append(
-                f"- {date}：白天{day_weather} {day_temp}°C，夜间{night_weather} {night_temp}°C"
-            )
-        return lines
 
     def _offline_answer(
         self,

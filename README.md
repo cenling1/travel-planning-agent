@@ -4,10 +4,11 @@
 
 ## 核心能力
 
-- DeepSeek Chat 提取出发地、目的地、日期、预算和偏好，并生成最终旅行方案
+- DeepSeek Chat 预分析需求，并通过通用工具目录自主规划工具调用
+- 使用 JSON ReAct 风格的“规划 → 执行 → Observation → 补充规划”链路
 - 识别简单、复杂和多目的地旅行场景
 - DeepSeek R1 辅助复杂路线和约束分析
-- MCP Streamable HTTP 对接 12306、高德、黄历和航班服务
+- MCP Streamable HTTP 对接 12306 实时车次服务
 - TXT、Markdown、PDF、CSV 文档导入、删除和重新索引
 - pgvector 语义检索与 BM25 关键词检索融合
 - 基于语义、关键词、覆盖率和分块质量的二次排序
@@ -28,9 +29,12 @@ Vue 3 + Nginx
 FastAPI backend/main.py
       |
       +-- TravelAgentService
-      |     +-- DeepSeek Chat / Reasoner
-      |     +-- MCP tools
-      |     `-- Hybrid RAG + citations
+      |     +-- 需求预分析与场景路由
+      |     +-- 通用 Agent 工具规划循环
+      |     |     +-- Hybrid RAG + citations
+      |     |     +-- 12306 实时车次 MCP
+      |     |     `-- 工具失败观察与补充调用
+      |     `-- DeepSeek Chat / Reasoner 综合生成
      |
       +-- Conversation API
       +-- Memory API
@@ -50,7 +54,7 @@ travel-planning-agent/
 |   |-- api/                       # 聊天、会话、文档、健康检查
 |   |-- integrations/              # DeepSeek Reasoner 与 MCP 客户端
 |   |-- repositories/              # SQLAlchemy 数据访问
-|   |-- services/                  # Agent、RAG、Embedding、MCP
+|   |-- services/                  # Agent、通用工具目录、RAG、Embedding、MCP
 |   |-- models.py                  # 会话、消息、文档、向量分块、长期记忆
 |   `-- schemas.py                 # Pydantic API 模型
 |-- migrations/                    # Alembic 数据库迁移
@@ -262,7 +266,7 @@ npm test
 - 上传文件限制为20MB，并由后端再次校验文件类型
 - MCP服务地址如果包含私有鉴权信息，应改为环境变量或Secret管理
 - 生产环境不要暴露 PostgreSQL 5432 或 FastAPI 8000 端口
-- 票价、酒店、天气和航班信息应以官方渠道为准
+- 车次和票务信息应以 12306 官方渠道为准
 
 ## License
 

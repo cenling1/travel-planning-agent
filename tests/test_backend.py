@@ -227,6 +227,23 @@ class BackendServiceTests(unittest.TestCase):
         self.assertIn("train", extraction["tool_intents"])
         self.assertFalse(service._is_complete_realtime_request(extraction))
 
+    def test_train_query_ignores_relative_date_as_route_origin(self):
+        service = TravelAgentService(self.database, self.settings)
+
+        extraction = service._normalize_extraction(
+            "我在娄底，明天去上海坐高铁",
+            {},
+        )
+
+        self.assertEqual(extraction["origin"], "娄底")
+        self.assertEqual(extraction["destination"], "上海")
+        self.assertEqual(
+            extraction["travel_date"],
+            (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d"),
+        )
+        self.assertEqual(extraction["tool_intents"], ["train"])
+        self.assertTrue(service._is_complete_realtime_request(extraction))
+
     def test_direct_train_query_returns_realtime_result_without_planning(self):
         service = TravelAgentService(self.database, self.settings)
 

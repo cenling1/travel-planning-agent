@@ -423,7 +423,7 @@ class TravelAgentService:
         )
         route_match = re.search(
             r"(?:从\s*)?([^，,。\s]+?)(?:出发)?(?:去|到)([^，,。\s]+?)"
-            r"(?=(?:，|,|。|\s|帮|查|玩|旅游|旅行|出行|安排|的|12306|车票|高铁|动车|$))",
+            r"(?=(?:，|,|。|\s|帮|查|玩|旅游|旅行|出行|安排|坐|乘|搭|的|12306|车票|高铁|动车|$))",
             route_query,
         )
         current_location_match = re.search(
@@ -469,7 +469,9 @@ class TravelAgentService:
         destination = ""
         origin = ""
         if route_match:
-            origin = route_match.group(1)
+            route_origin = route_match.group(1)
+            if route_origin not in {"今天", "明天", "后天"}:
+                origin = route_origin
             destination = route_match.group(2)
         elif destination_match:
             destination = destination_match.group(1)

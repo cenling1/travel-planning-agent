@@ -28,7 +28,11 @@ async def migrate(chroma_path: Path) -> None:
         service = KnowledgeService(database)
         for source, contents in grouped.items():
             filename = source if Path(source).suffix.lower() in {".txt", ".md"} else f"{source}.txt"
-            document = await service.ingest(filename, "\n\n".join(contents).encode("utf-8"))
+            document = await service.ingest(
+                "local",
+                filename,
+                "\n\n".join(contents).encode("utf-8"),
+            )
             print(f"{filename}: {document.status}, {document.chunk_count} chunks")
 
 
@@ -38,7 +42,7 @@ def main() -> None:
     parser.add_argument(
         "--chroma-path",
         type=Path,
-        default=Path("aggentic_RAG/data/travel_vectordb"),
+        default=Path("data/legacy_chroma"),
     )
     args = parser.parse_args()
     print(f"database: {settings.database_url}")

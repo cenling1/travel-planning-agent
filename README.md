@@ -1,10 +1,10 @@
 # 智能旅行规划助手
 
-一个前后端分离的 AI 旅行规划应用。Streamlit 提供聊天和知识库管理界面，FastAPI 负责会话、文档、混合 RAG 和旅行 Agent，PostgreSQL + pgvector 用于生产环境的关系数据与向量检索。
+一个前后端分离的 AI 旅行规划应用。Vue 3 提供旅行工作台、知识库和账号管理界面，FastAPI 负责会话、文档、混合 RAG 和旅行 Agent，PostgreSQL + pgvector 用于生产环境的关系数据与向量检索。
 
 ## 核心能力
 
-- Qwen 提取出发地、目的地、日期、预算和偏好
+- DeepSeek Chat 提取出发地、目的地、日期、预算和偏好，并生成最终旅行方案
 - 识别简单、复杂和多目的地旅行场景
 - DeepSeek R1 辅助复杂路线和约束分析
 - MCP Streamable HTTP 对接 12306、高德、黄历和航班服务
@@ -13,24 +13,27 @@
 - 基于语义、关键词、覆盖率和分块质量的二次排序
 - 回答返回文件名、页码、分块和引用编号
 - 会话和消息持久化，可恢复历史对话
+- 多用户隔离：会话、文档、检索和长期记忆均按用户归属过滤
+- 长期偏好记忆：自动保存明确偏好，并提供查看和删除入口
 - SQLite 离线开发模式和 PostgreSQL/pgvector 生产模式
 - RAG 评测集及 Recall@K、MRR、关键词覆盖率指标
 
 ## 架构
 
 ```text
-Streamlit app.py
+Vue 3 + Nginx
       |
-      | HTTP
+      | /api + NDJSON stream
       v
 FastAPI backend/main.py
       |
       +-- TravelAgentService
-      |     +-- Qwen / DeepSeek
+      |     +-- DeepSeek Chat / Reasoner
       |     +-- MCP tools
       |     `-- Hybrid RAG + citations
-      |
+     |
       +-- Conversation API
+      +-- Memory API
       `-- Document API
              |
              +-- PostgreSQL + pgvector（生产）
@@ -41,16 +44,17 @@ FastAPI backend/main.py
 
 ```text
 travel-planning-agent/
-|-- app.py                         # Streamlit API 前端
-|-- frontend/api_client.py         # FastAPI 客户端
+|-- frontend-web/                  # Vue 3 + TypeScript 前端
 |-- backend/
 |   |-- main.py                    # FastAPI 入口
 |   |-- api/                       # 聊天、会话、文档、健康检查
+|   |-- integrations/              # DeepSeek Reasoner 与 MCP 客户端
 |   |-- repositories/              # SQLAlchemy 数据访问
 |   |-- services/                  # Agent、RAG、Embedding、MCP
-|   |-- models.py                  # 会话、消息、文档、向量分块
+|   |-- models.py                  # 会话、消息、文档、向量分块、长期记忆
 |   `-- schemas.py                 # Pydantic API 模型
 |-- migrations/                    # Alembic 数据库迁移
+|-- config/                        # MCP 配置模板，本地配置不提交
 |-- evaluation/rag_questions.json  # RAG 评测集
 |-- scripts/
 |   |-- evaluate_rag.py            # 检索评测
@@ -58,7 +62,7 @@ travel-planning-agent/
 |-- tests/                         # 单元与服务测试
 |-- Dockerfile
 |-- docker-compose.yml
-`-- aggentic_RAG/                  # 模型、MCP 和旧 Chroma 兼容模块
+`-- requirements.txt               # Python 后端依赖
 ```
 
 ## 安装
@@ -69,30 +73,45 @@ travel-planning-agent/
 py -3.11 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
-pip install -e ./aggentic_RAG
+pip install -r requirements.txt
 ```
 
-`setup.py` 会读取 `aggentic_RAG/requirements.txt`，只需要维护一份依赖清单。
+Python 后端依赖统一维护在根目录 `requirements.txt`。
 
 ## 配置
 
-在项目根目录或 `aggentic_RAG/.env` 配置：
+复制根目录 `.env.example` 为 `.env` 并配置：
 
 ```dotenv
 DASHSCOPE_API_KEY=your-dashscope-api-key
 DEEPSEEK_API_KEY=your-deepseek-api-key
+DEEPSEEK_CHAT_MODEL=deepseek-v4-pro
+DEEPSEEK_REASONING_MODEL=deepseek-v4-pro
+DEEPSEEK_BASE_URL=https://api.deepseek.com
+DEEPSEEK_TEMPERATURE=0.7
+DEEPSEEK_THINKING_ENABLED=false
 
 # 本地不配置时自动使用 SQLite
 DATABASE_URL=postgresql+psycopg://travel_agent:travel_agent@localhost:5432/travel_agent
-UPLOAD_DIR=aggentic_RAG/data/uploads
+UPLOAD_DIR=data/uploads
 EMBEDDING_MODEL=text-embedding-v4
 EMBEDDING_DIMENSION=1024
 
-MCP_CONFIG_PATH=travel_agent/config/servers_config.json
+MCP_CONFIG_PATH=config/servers_config.json
 BACKEND_URL=http://localhost:8000
+TRAVEL_CLIENT_ID=local
+
+# 本地默认关闭认证；生产环境见 .env.production.example
+AUTH_ENABLED=false
+AUTH_REGISTRATION_ENABLED=true
+JWT_SECRET=
+JWT_ACCESS_MINUTES=15
+JWT_REFRESH_DAYS=30
+RATE_LIMIT_PER_MINUTE=0
+MAX_INFLIGHT_REQUESTS=0
 ```
 
-没有 DashScope Key 时，Embedding 使用确定性的本地 Hash 向量，便于离线开发和测试；模型回答会进入明确的离线降级模式。
+DeepSeek Key 用于需求提取、复杂路线分析和最终回答，Agent 的全部模型推理均由 DeepSeek 完成。DashScope 仅用于知识库文本 Embedding；没有 DashScope Key 时会使用确定性的本地 Hash 向量。没有 DeepSeek Key 时，回答会进入明确的离线降级模式。
 
 ## 本地启动
 
@@ -105,16 +124,22 @@ BACKEND_URL=http://localhost:8000
 终端二：
 
 ```powershell
-.\.venv\Scripts\streamlit.exe run app.py --server.port 8501
+cd frontend-web
+npm ci
+npm run dev
 ```
+
+后端不在默认的 8000 端口时，可在启动前设置 `VITE_API_PROXY_TARGET`（例如 `http://localhost:8001`）。
 
 访问地址：
 
-- 前端：http://localhost:8501
+- Vue 前端：http://localhost:5173
 - API：http://localhost:8000
 - Swagger：http://localhost:8000/docs
 
-未设置 `DATABASE_URL` 时，后端使用 `aggentic_RAG/data/travel_agent.db`。
+使用开发 Compose 时，Vue + Nginx 入口为 http://localhost:8080。
+
+未设置 `DATABASE_URL` 时，后端使用 `data/travel_agent.db`。
 
 ## Docker Compose
 
@@ -126,9 +151,17 @@ Compose 会启动：
 
 - `postgres`：PostgreSQL 16 + pgvector
 - `backend`：FastAPI 和 Alembic迁移
-- `frontend`：Streamlit
+- `web`：Vue 3 构建产物和 Nginx
 
 PostgreSQL数据和上传文档分别保存在持久卷中。
+
+生产部署请使用独立配置：
+
+```bash
+docker compose --env-file .env -f docker-compose.prod.yml up -d --build
+```
+
+生产配置由 `web` 服务使用 Nginx 提供 Vue 静态资源、HTTPS 和 API 反向代理，仅公开 80/443；应用使用数据库账号、Argon2 密码哈希、HttpOnly Cookie 刷新令牌和 `user/admin` 角色权限。后端和 PostgreSQL 保持在 Docker 内网。详细步骤见 `docs/deployment.md`。
 
 ## API
 
@@ -143,6 +176,15 @@ PostgreSQL数据和上传文档分别保存在持久卷中。
 | `POST` | `/api/documents/search` | 混合检索 |
 | `POST` | `/api/documents/{id}/reindex` | 重新索引 |
 | `DELETE` | `/api/documents/{id}` | 删除文档和分块 |
+| `GET/POST` | `/api/memories` | 查询或写入长期记忆 |
+| `DELETE` | `/api/memories/{id}` | 删除长期记忆 |
+| `POST` | `/api/auth/register` | 注册账号（可关闭） |
+| `POST` | `/api/auth/login` | 登录并签发访问/刷新令牌 |
+| `POST` | `/api/auth/refresh` | 轮换刷新令牌 |
+| `POST` | `/api/auth/logout` | 退出当前会话 |
+| `GET` | `/api/auth/me` | 当前账号 |
+| `GET/POST` | `/api/admin/users` | 管理员查询或创建账号 |
+| `PATCH` | `/api/admin/users/{id}` | 管理员调整角色或状态 |
 
 ## 混合 RAG
 
@@ -162,10 +204,11 @@ PostgreSQL使用 `<=>` 余弦距离在数据库内筛选向量候选；SQLite模
 ## 迁移旧 Chroma 数据
 
 ```powershell
+pip install -r requirements-migration.txt
 .\.venv\Scripts\python.exe scripts/migrate_chroma_to_database.py
 ```
 
-脚本读取 `aggentic_RAG/data/travel_vectordb` 的 `travel_knowledge` 集合，按来源合并内容并写入新知识库。
+脚本默认读取 `data/legacy_chroma` 的 `travel_knowledge` 集合，按来源合并内容并写入新知识库。
 
 ## RAG 评测
 
@@ -190,11 +233,14 @@ curl.exe -F "files=@evaluation/corpus/chengdu.md" -F "files=@evaluation/corpus/b
 ## 测试
 
 ```powershell
-$env:PYTHONPATH="aggentic_RAG"
+$env:AUTH_ENABLED="false"
+$env:PYTHONIOENCODING="utf-8"
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
+cd frontend-web
+npm test
 ```
 
-测试覆盖文档生命周期、混合检索、离线Agent、会话隔离、MCP重试和旧Chroma稳定ID。
+测试覆盖流式 NDJSON、Multipart 上传、并发令牌刷新、Cookie 轮换、文档生命周期、混合检索、离线 Agent、JWT 身份隔离、角色权限、MCP 重试和旧 Chroma 稳定 ID。
 
 ## 工程设计与扩展性
 
@@ -203,12 +249,19 @@ $env:PYTHONPATH="aggentic_RAG"
 - 文档解析、分块、Embedding 与索引流程采用独立服务封装，可扩展为异步任务队列以处理大规模文档
 - MCP 工具层统一管理外部服务连接、超时、重试与异常返回，便于继续增加酒店、天气和交通数据源
 - 数据访问层同时适配 SQLite 与 PostgreSQL/pgvector，兼顾本地开发效率和生产环境扩展能力
+- 尚未接入邮件服务；忘记密码需要管理员在账号管理界面重置
+- BM25采用应用层分词，大规模语料应接入更专业的中文检索引擎
+- 当前二次排序为轻量规则模型，不是Cross-Encoder Reranker
+- 文档索引在请求内完成，大文件应改为异步任务队列
+- 外部实时数据取决于MCP服务可用性
+- Docker配置已提供，但需要本机安装Docker后才能运行
 
 ## 安全
 
 - 不要提交 `.env`、API Key、Cookie或访问令牌
 - 上传文件限制为20MB，并由后端再次校验文件类型
 - MCP服务地址如果包含私有鉴权信息，应改为环境变量或Secret管理
+- 生产环境不要暴露 PostgreSQL 5432 或 FastAPI 8000 端口
 - 票价、酒店、天气和航班信息应以官方渠道为准
 
 ## License

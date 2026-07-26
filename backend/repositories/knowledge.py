@@ -8,8 +8,14 @@ class KnowledgeRepository:
     def __init__(self, database: Session):
         self.database = database
 
-    def find_duplicate(self, filename: str, content_hash: str) -> KnowledgeDocument | None:
+    def find_duplicate(
+        self,
+        owner_id: str,
+        filename: str,
+        content_hash: str,
+    ) -> KnowledgeDocument | None:
         statement = select(KnowledgeDocument).where(
+            KnowledgeDocument.owner_id == owner_id,
             KnowledgeDocument.filename == filename,
             KnowledgeDocument.content_hash == content_hash,
         )
@@ -18,12 +24,14 @@ class KnowledgeRepository:
     def create_document(
         self,
         *,
+        owner_id: str,
         filename: str,
         file_type: str,
         content_hash: str,
         storage_path: str,
     ) -> KnowledgeDocument:
         document = KnowledgeDocument(
+            owner_id=owner_id,
             filename=filename,
             file_type=file_type,
             content_hash=content_hash,
@@ -35,24 +43,36 @@ class KnowledgeRepository:
         self.database.refresh(document)
         return document
 
-    def list_documents(self) -> list[KnowledgeDocument]:
-        statement = select(KnowledgeDocument).order_by(KnowledgeDocument.created_at.desc())
+    def list_documents(self, owner_id: str) -> list[KnowledgeDocument]:
+        statement = (
+            select(KnowledgeDocument)
+            .where(KnowledgeDocument.owner_id == owner_id)
+            .order_by(KnowledgeDocument.created_at.desc())
+        )
         return list(self.database.scalars(statement))
 
-    def get_document(self, document_id: str) -> KnowledgeDocument | None:
-        return self.database.get(KnowledgeDocument, document_id)
+    def get_document(self, owner_id: str, document_id: str) -> KnowledgeDocument | None:
+        statement = select(KnowledgeDocument).where(
+            KnowledgeDocument.id == document_id,
+            KnowledgeDocument.owner_id == owner_id,
+        )
+        return self.database.scalar(statement)
 
-    def all_ready_chunks(self, limit: int = 5000) -> list[DocumentChunk]:
+    def all_ready_chunks(self, owner_id: str, limit: int = 5000) -> list[DocumentChunk]:
         statement = (
             select(DocumentChunk)
             .join(KnowledgeDocument)
-            .where(KnowledgeDocument.status == "ready")
+            .where(
+                KnowledgeDocument.owner_id == owner_id,
+                KnowledgeDocument.status == "ready",
+            )
             .limit(limit)
         )
         return list(self.database.scalars(statement))
 
     def vector_candidates(
         self,
+        owner_id: str,
         query_embedding: list[float],
         limit: int,
     ) -> list[tuple[DocumentChunk, float]]:
@@ -60,7 +80,10 @@ class KnowledgeRepository:
         statement = (
             select(DocumentChunk, distance)
             .join(KnowledgeDocument)
-            .where(KnowledgeDocument.status == "ready")
+            .where(
+                KnowledgeDocument.owner_id == owner_id,
+                KnowledgeDocument.status == "ready",
+            )
             .order_by(distance)
             .limit(limit)
         )

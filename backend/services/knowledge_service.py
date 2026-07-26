@@ -53,7 +53,7 @@ class KnowledgeService:
         self.embeddings = embeddings or EmbeddingService(self.settings)
         self.reranker = HybridReranker()
 
-    async def ingest(self, filename: str, content: bytes) -> KnowledgeDocument:
+    async def ingest(self, owner_id: str, filename: str, content: bytes) -> KnowledgeDocument:
         safe_name = Path(filename.replace("\\", "/")).name
         if safe_name in {"", ".", ".."}:
             raise ValueError("文件名无效")
@@ -68,16 +68,17 @@ class KnowledgeService:
             )
 
         content_hash = sha256(content).hexdigest()
-        duplicate = self.repository.find_duplicate(safe_name, content_hash)
+        duplicate = self.repository.find_duplicate(owner_id, safe_name, content_hash)
         if duplicate:
             return duplicate
 
-        storage_dir = self.settings.upload_dir / content_hash[:16]
+        storage_dir = self.settings.upload_dir / owner_id / content_hash[:16]
         storage_dir.mkdir(parents=True, exist_ok=True)
         storage_path = storage_dir / safe_name
         storage_path.write_bytes(content)
 
         document = self.repository.create_document(
+            owner_id=owner_id,
             filename=safe_name,
             file_type=suffix.lstrip("."),
             content_hash=content_hash,
@@ -137,11 +138,11 @@ class KnowledgeService:
             self.repository.mark_failed(document, str(exc))
             raise
 
-    def list_documents(self) -> list[KnowledgeDocument]:
-        return self.repository.list_documents()
+    def list_documents(self, owner_id: str) -> list[KnowledgeDocument]:
+        return self.repository.list_documents(owner_id)
 
-    def get_document(self, document_id: str) -> KnowledgeDocument | None:
-        return self.repository.get_document(document_id)
+    def get_document(self, owner_id: str, document_id: str) -> KnowledgeDocument | None:
+        return self.repository.get_document(owner_id, document_id)
 
     def delete_document(self, document: KnowledgeDocument) -> None:
         storage_path = Path(document.storage_path)
@@ -150,15 +151,24 @@ class KnowledgeService:
         if storage_dir.exists() and self.settings.upload_dir in storage_dir.parents:
             shutil.rmtree(storage_dir, ignore_errors=True)
 
-    async def search(self, query: str, top_k: int | None = None) -> list[Citation]:
+    async def search(
+        self,
+        owner_id: str,
+        query: str,
+        top_k: int | None = None,
+    ) -> list[Citation]:
         limit = top_k or self.settings.search_k
-        all_chunks = self.repository.all_ready_chunks()
+        all_chunks = self.repository.all_ready_chunks(owner_id)
         if not all_chunks:
             return []
 
         query_embedding = await self.embeddings.embed_query(query)
         if self.settings.is_postgres:
-            vector_rows = self.repository.vector_candidates(query_embedding, max(limit * 8, 30))
+            vector_rows = self.repository.vector_candidates(
+                owner_id,
+                query_embedding,
+                max(limit * 8, 30),
+            )
             vector_scores = {
                 chunk.id: max(0.0, 1.0 - distance)
                 for chunk, distance in vector_rows

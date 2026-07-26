@@ -27,6 +27,28 @@ def init_db() -> None:
         with engine.begin() as connection:
             connection.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
     Base.metadata.create_all(bind=engine)
+    if settings.database_url.startswith("sqlite"):
+        _ensure_sqlite_schema()
+
+
+def _ensure_sqlite_schema() -> None:
+    with engine.begin() as connection:
+        document_columns = {
+            row[1] for row in connection.execute(text("PRAGMA table_info(knowledge_documents)"))
+        }
+        if "owner_id" not in document_columns:
+            connection.execute(
+                text(
+                    "ALTER TABLE knowledge_documents "
+                    "ADD COLUMN owner_id VARCHAR(64) NOT NULL DEFAULT 'local'"
+                )
+            )
+            connection.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS ix_knowledge_documents_owner_id "
+                    "ON knowledge_documents (owner_id)"
+                )
+            )
 
 
 def get_db() -> Generator[Session, None, None]:

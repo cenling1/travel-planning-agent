@@ -4,8 +4,7 @@ import json
 import time
 from typing import Any
 
-from aggentic_RAG.travel_agent.tools.mcp_tools import MCPToolManager
-
+from ..integrations.mcp import MCPToolManager
 from ..schemas import ToolResult
 
 
@@ -14,6 +13,16 @@ def _json_value(value: str) -> Any:
         return json.loads(value)
     except (TypeError, json.JSONDecodeError):
         return value
+
+
+def _is_error_content(content: str) -> bool:
+    parsed = _json_value(content)
+    if isinstance(parsed, dict) and parsed.get("error"):
+        return True
+    if not isinstance(parsed, str):
+        return False
+    normalized = parsed.strip().lower()
+    return normalized.startswith(("error:", "工具调用失败:")) or "station not found" in normalized
 
 
 class MCPTravelService:
@@ -31,18 +40,16 @@ class MCPTravelService:
                 self._initialized = True
 
     async def call(self, server: str, tool: str, **arguments) -> ToolResult:
-        await self.initialize()
         started = time.perf_counter()
         try:
+            await self.initialize()
             content = await asyncio.wait_for(
                 self.manager.call_tool(server, tool, **arguments),
                 timeout=25,
             )
-            parsed = _json_value(content)
-            success = not (isinstance(parsed, dict) and parsed.get("error"))
             return ToolResult(
                 name=tool,
-                success=success,
+                success=not _is_error_content(content),
                 content=content,
                 latency_ms=int((time.perf_counter() - started) * 1000),
             )
@@ -55,7 +62,6 @@ class MCPTravelService:
             )
 
     async def collect(self, extraction: dict, query: str) -> list[ToolResult]:
-        await self.initialize()
         destinations = [
             city.strip()
             for city in str(extraction.get("destination", "")).replace("，", ",").split(",")
@@ -64,20 +70,50 @@ class MCPTravelService:
         origin = str(extraction.get("origin", "")).strip()
         travel_date = str(extraction.get("travel_date", "")).strip()
         travel_days = int(extraction.get("travel_days") or 0)
+        tool_intents = set(extraction.get("tool_intents") or [])
+
+        may_call_tools = (
+            destinations
+            and tool_intents.intersection({"weather", "attractions", "hotel"})
+        ) or (
+            origin
+            and destinations
+            and (
+                "train" in tool_intents
+                or (travel_date and "flight" in tool_intents)
+            )
+        ) or (travel_date and "calendar" in tool_intents)
+        if not may_call_tools:
+            return []
+
+        try:
+            await self.initialize()
+        except (OSError, json.JSONDecodeError):
+            return [
+                ToolResult(
+                    name="realtime-tools",
+                    success=False,
+                    content="实时工具尚未配置，当前无法查询实时数据。",
+                )
+            ]
 
         tasks = []
         for city in destinations[:2]:
             if "Gaode Server" in self.manager.servers:
-                tasks.append(self.call("Gaode Server", "maps_weather", city=city))
-                tasks.append(
-                    self.call(
-                        "Gaode Server",
-                        "maps_text_search",
-                        keywords=f"{city} 景点",
-                        city=city,
+                if "weather" in tool_intents:
+                    tasks.append(self.call("Gaode Server", "maps_weather", city=city))
+                if "attractions" in tool_intents:
+                    tasks.append(
+                        self.call(
+                            "Gaode Server",
+                            "maps_text_search",
+                            keywords=f"{city} 景点",
+                            city=city,
+                        )
                     )
-                )
-                if travel_days > 1 or any(word in query for word in ("酒店", "住宿", "民宿")):
+                if "hotel" in tool_intents and (
+                    travel_days > 1 or any(word in query for word in ("酒店", "住宿", "民宿"))
+                ):
                     tasks.append(
                         self.call(
                             "Gaode Server",
@@ -87,10 +123,27 @@ class MCPTravelService:
                         )
                     )
 
-        if origin and destinations and travel_date and "12306 Server" in self.manager.servers:
-            tasks.append(self.query_train(origin, destinations[0], travel_date))
+        if (
+            "train" in tool_intents
+            and origin
+            and destinations
+            and "12306 Server" in self.manager.servers
+        ):
+            train_filter_flags = ""
+            if "高铁" in query:
+                train_filter_flags = "G"
+            elif "动车" in query:
+                train_filter_flags = "D"
+            tasks.append(
+                self.query_train(
+                    origin,
+                    destinations[0],
+                    travel_date,
+                    train_filter_flags=train_filter_flags,
+                )
+            )
 
-        if travel_date and any(word in query for word in ("黄历", "吉日", "宜出行")):
+        if travel_date and "calendar" in tool_intents:
             if "bazi Server" in self.manager.servers:
                 tasks.append(
                     self.call(
@@ -100,7 +153,7 @@ class MCPTravelService:
                     )
                 )
 
-        if destinations and travel_date and any(word in query for word in ("飞机", "航班")):
+        if destinations and travel_date and "flight" in tool_intents:
             if "flight Server" in self.manager.servers:
                 tasks.append(
                     self.call(
@@ -116,7 +169,15 @@ class MCPTravelService:
             return []
         return list(await asyncio.gather(*tasks))
 
-    async def query_train(self, origin: str, destination: str, date: str) -> ToolResult:
+    async def query_train(
+        self,
+        origin: str,
+        destination: str,
+        date: str,
+        train_filter_flags: str = "",
+    ) -> ToolResult:
+        if not date:
+            date = datetime.now().strftime("%Y-%m-%d")
         try:
             date_value = datetime.strptime(date, "%Y-%m-%d")
             if date_value.year < datetime.now().year:
@@ -132,6 +193,10 @@ class MCPTravelService:
             fromStation=origin_code or origin,
             toStation=destination_code or destination,
             date=date,
+            trainFilterFlags=train_filter_flags,
+            sortFlag="duration",
+            limitedNum=10,
+            format="text",
         )
 
     async def _station_code(self, city: str) -> str | None:
@@ -165,7 +230,10 @@ class MCPTravelService:
         return None
 
     async def health(self) -> dict[str, bool]:
-        await self.initialize()
+        try:
+            await self.initialize()
+        except (OSError, json.JSONDecodeError):
+            return {}
         return {
             name: bool(connection.session_id)
             for name, connection in self.manager.servers.items()

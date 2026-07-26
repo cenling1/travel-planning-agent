@@ -1,0 +1,27 @@
+# LangChain 文档与模型适配
+langchain-openai>=0.2.0
+langchain-community>=0.3.0
+langchain-text-splitters>=0.3.0
+
+# LLM 提供商
+dashscope>=1.20.0  # 知识库文本 Embedding
+openai>=1.0.0      # OpenAI API兼容
+
+# MCP Streamable HTTP 客户端
+httpx>=0.27.0
+
+# API 与数据库
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+sqlalchemy>=2.0.0
+alembic>=1.13.0
+psycopg[binary]>=3.2.0
+pgvector>=0.3.0
+python-multipart>=0.0.9
+rank-bm25>=0.2.2
+argon2-cffi>=23.1.0
+PyJWT>=2.9.0
+
+# 其他
+python-dotenv>=1.0.0
+pypdf>=5.0.0

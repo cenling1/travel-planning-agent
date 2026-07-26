@@ -3,7 +3,11 @@
 .venv
 __pycache__
 *.pyc
+frontend-web/node_modules
+frontend-web/dist
 .env
-aggentic_RAG/data/travel_agent.db*
-aggentic_RAG/data/uploads
-aggentic_RAG/data/travel_vectordb
+*.env
+servers_config.json
+config/servers_config.json
+data
+tmp

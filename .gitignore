@@ -169,13 +169,9 @@ cython_debug/
 
 # Local runtime data
 tmp/
-aggentic_RAG/data/travel_agent.db*
-aggentic_RAG/data/uploads/
-aggentic_RAG/data/travel_vectordb/
-aggentic_RAG/travel_agent/config/servers_config.json
-
-# Streamlit secrets
-.streamlit/secrets.toml
+/data/
+/tmp/
+config/servers_config.json
 
 # Ruff stuff:
 .ruff_cache/
@@ -189,3 +185,18 @@ aggentic_RAG/travel_agent/config/servers_config.json
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+
+# Local development and deployment secrets
+.claude/
+.vscode/
+frontend-web/node_modules/
+frontend-web/dist/
+frontend-web/.vite/
+*.tsbuildinfo
+backups/
+certs/
+private/
+*.pem
+*.key
+*.crt
+*.db

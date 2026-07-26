@@ -1,0 +1,4 @@
+-r requirements.txt
+
+# Only required by scripts/migrate_chroma_to_database.py.
+chromadb>=0.5.0

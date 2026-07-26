@@ -3,6 +3,7 @@ import uuid
 
 from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
+    Boolean,
     DateTime,
     Float,
     ForeignKey,
@@ -45,6 +46,44 @@ class TimestampMixin:
     )
 
 
+class User(TimestampMixin, Base):
+    __tablename__ = "users"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    username: Mapped[str] = mapped_column(String(64), unique=True, index=True, nullable=False)
+    email: Mapped[str | None] = mapped_column(String(320), unique=True, index=True, nullable=True)
+    password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
+    role: Mapped[str] = mapped_column(String(20), default="user", index=True, nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True, nullable=False)
+    token_version: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    refresh_tokens: Mapped[list["RefreshToken"]] = relationship(
+        back_populates="user",
+        cascade="all, delete-orphan",
+    )
+
+
+class RefreshToken(Base):
+    __tablename__ = "refresh_tokens"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    user_id: Mapped[str] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"),
+        index=True,
+        nullable=False,
+    )
+    token_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True, nullable=False)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    replaced_by_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+
+    user: Mapped[User] = relationship(back_populates="refresh_tokens")
+
+
 class Conversation(TimestampMixin, Base):
     __tablename__ = "conversations"
 
@@ -83,10 +122,11 @@ class Message(Base):
 class KnowledgeDocument(TimestampMixin, Base):
     __tablename__ = "knowledge_documents"
     __table_args__ = (
-        UniqueConstraint("filename", "content_hash", name="uq_document_filename_hash"),
+        UniqueConstraint("owner_id", "filename", "content_hash", name="uq_document_owner_filename_hash"),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    owner_id: Mapped[str] = mapped_column(String(64), index=True, default="local", nullable=False)
     filename: Mapped[str] = mapped_column(String(255), index=True, nullable=False)
     file_type: Mapped[str] = mapped_column(String(20), nullable=False)
     content_hash: Mapped[str] = mapped_column(String(64), index=True, nullable=False)
@@ -126,3 +166,20 @@ class DocumentChunk(Base):
     quality_score: Mapped[float] = mapped_column(Float, default=1.0, nullable=False)
 
     document: Mapped[KnowledgeDocument] = relationship(back_populates="chunks")
+
+
+class UserMemory(TimestampMixin, Base):
+    __tablename__ = "user_memories"
+    __table_args__ = (
+        UniqueConstraint("owner_id", "memory_key", name="uq_user_memory_key"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    owner_id: Mapped[str] = mapped_column(String(64), index=True, nullable=False)
+    memory_key: Mapped[str] = mapped_column(String(120), nullable=False)
+    memory_type: Mapped[str] = mapped_column(String(40), default="preference", nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    importance: Mapped[float] = mapped_column(Float, default=0.6, nullable=False)
+    is_active: Mapped[bool] = mapped_column(default=True, nullable=False)
+    memory_metadata: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

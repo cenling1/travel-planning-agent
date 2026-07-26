@@ -5,11 +5,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-COPY aggentic_RAG/requirements.txt aggentic_RAG/setup.py /app/aggentic_RAG/
-COPY aggentic_RAG/travel_agent /app/aggentic_RAG/travel_agent
+COPY requirements.txt /app/requirements.txt
 RUN python -m pip install --no-cache-dir --upgrade pip \
-    && python -m pip install --no-cache-dir -e /app/aggentic_RAG
+    && python -m pip install --no-cache-dir -r /app/requirements.txt
 
 COPY . /app
 
-EXPOSE 8000 8501
+EXPOSE 8000

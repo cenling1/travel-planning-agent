@@ -20,6 +20,9 @@ def health(database: Session = Depends(get_db)) -> HealthResponse:
         status="ok",
         database="postgresql-pgvector" if settings.is_postgres else "sqlite-fallback",
         embedding_provider=EmbeddingService(settings).provider,
+        auth_enabled=settings.auth_enabled,
+        registration_enabled=settings.auth_enabled and settings.auth_registration_enabled,
+        max_upload_bytes=settings.max_upload_bytes,
     )
 
 

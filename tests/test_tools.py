@@ -1,13 +1,11 @@
 import asyncio
 import json
-import tempfile
 import unittest
-from unittest.mock import AsyncMock, MagicMock, mock_open, patch
+from unittest.mock import AsyncMock, mock_open, patch
 
-from langchain_core.documents import Document
+import httpx
 
-from travel_agent.tools.mcp_tools import MCPServerConnection, MCPToolManager
-from travel_agent.tools.rag_tool import TravelRAG
+from backend.integrations.mcp import MCPServerConnection, MCPToolManager
 
 
 class FlakyConnection:
@@ -36,7 +34,7 @@ class MCPToolManagerTests(unittest.IsolatedAsyncioTestCase):
         manager = MCPToolManager(config_path="servers.json")
 
         with (
-            patch("travel_agent.tools.mcp_tools.os.path.exists", return_value=True),
+            patch("backend.integrations.mcp.os.path.exists", return_value=True),
             patch("builtins.open", mock_open(read_data=config)),
             patch.object(
                 MCPServerConnection,
@@ -81,45 +79,53 @@ class MCPToolManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(connection.calls, 1)
         self.assertIn("invalid tool arguments", json.loads(result)["error"])
 
+    async def test_reinitializes_and_retries_expired_session(self):
+        manager = MCPToolManager(config_path="unused.json")
+        connection = FlakyConnection(failures=0)
 
-class TravelRAGTests(unittest.TestCase):
-    @patch("travel_agent.tools.rag_tool.DashScopeEmbeddings")
-    @patch("travel_agent.tools.rag_tool.Chroma")
-    def test_existing_vector_store_is_loaded_after_restart(
-        self,
-        chroma_class,
-        _embeddings_class,
-    ):
-        vector_store = MagicMock()
-        vector_store.get.return_value = {"ids": ["chunk-1", "chunk-2"]}
-        chroma_class.return_value = vector_store
+        async def expire_once(tool_name, arguments):
+            connection.calls += 1
+            if connection.calls == 1:
+                request = httpx.Request("POST", "https://private.example/mcp")
+                response = httpx.Response(401, request=request)
+                raise httpx.HTTPStatusError(
+                    "401 Unauthorized for private endpoint",
+                    request=request,
+                    response=response,
+                )
+            connection.session_id = "renewed-session"
+            return json.dumps({"tool": tool_name, "arguments": arguments})
 
-        with tempfile.TemporaryDirectory() as persist_directory:
-            rag = TravelRAG(
-                persist_directory=persist_directory,
-                embedding_api_key="test-key",
+        connection.call_tool = expire_once
+        manager.servers["test"] = connection
+
+        with patch.object(asyncio, "sleep", new=AsyncMock()):
+            result = await manager.call_tool("test", "lookup", city="Shanghai")
+
+        self.assertEqual(connection.calls, 2)
+        self.assertEqual(json.loads(result)["arguments"], {"city": "Shanghai"})
+
+    async def test_http_errors_do_not_expose_private_endpoint(self):
+        manager = MCPToolManager(config_path="unused.json")
+        connection = FlakyConnection(failures=0)
+
+        async def always_unauthorized(_tool_name, _arguments):
+            request = httpx.Request("POST", "https://private.example/mcp")
+            response = httpx.Response(401, request=request)
+            raise httpx.HTTPStatusError(
+                "401 Unauthorized for https://private.example/mcp",
+                request=request,
+                response=response,
             )
 
-        chroma_class.assert_called_once_with(
-            persist_directory=persist_directory,
-            embedding_function=rag.embeddings,
-            collection_name="travel_knowledge",
-        )
-        vector_store.as_retriever.assert_called_once()
-        self.assertEqual(rag.imported_ids, {"chunk-1", "chunk-2"})
-        self.assertIsNotNone(rag.retriever)
+        connection.call_tool = always_unauthorized
+        manager.servers["test"] = connection
 
-    def test_document_ids_are_stable_and_content_sensitive(self):
-        first = Document(page_content="West Lake guide", metadata={"source": "hangzhou.md"})
-        same = Document(page_content="West Lake guide", metadata={"source": "hangzhou.md"})
-        changed = Document(page_content="Updated West Lake guide", metadata={"source": "hangzhou.md"})
+        with patch.object(asyncio, "sleep", new=AsyncMock()):
+            result = await manager.call_tool("test", "lookup", max_retries=0)
 
-        first_id = TravelRAG.generate_doc_id(first, chunk_index=0)
-
-        self.assertEqual(first_id, TravelRAG.generate_doc_id(same, chunk_index=0))
-        self.assertNotEqual(first_id, TravelRAG.generate_doc_id(changed, chunk_index=0))
-        self.assertNotEqual(first_id, TravelRAG.generate_doc_id(first, chunk_index=1))
-
-
+        error = json.loads(result)["error"]
+        self.assertIn("HTTP 401 Unauthorized", error)
+        self.assertNotIn("private.example", error)
 if __name__ == "__main__":
     unittest.main()

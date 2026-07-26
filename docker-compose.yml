@@ -23,26 +23,44 @@ services:
     environment:
       DATABASE_URL: postgresql+psycopg://travel_agent:travel_agent@postgres:5432/travel_agent
       UPLOAD_DIR: /data/uploads
-      MCP_CONFIG_PATH: travel_agent/config/servers_config.json
+      MCP_CONFIG_PATH: /run/secrets/servers_config.json
       DASHSCOPE_API_KEY: ${DASHSCOPE_API_KEY:-}
       DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      DEEPSEEK_CHAT_MODEL: ${DEEPSEEK_CHAT_MODEL:-deepseek-v4-pro}
+      DEEPSEEK_REASONING_MODEL: ${DEEPSEEK_REASONING_MODEL:-deepseek-v4-pro}
+      DEEPSEEK_BASE_URL: ${DEEPSEEK_BASE_URL:-https://api.deepseek.com}
+      LLM_EXTRACTION_TIMEOUT_SECONDS: ${LLM_EXTRACTION_TIMEOUT_SECONDS:-12}
+      LLM_GENERATION_TIMEOUT_SECONDS: ${LLM_GENERATION_TIMEOUT_SECONDS:-75}
+      RAG_TIMEOUT_SECONDS: ${RAG_TIMEOUT_SECONDS:-12}
+      MCP_TIMEOUT_SECONDS: ${MCP_TIMEOUT_SECONDS:-30}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173,http://localhost:8080}
+      AUTH_ENABLED: ${AUTH_ENABLED:-false}
+      AUTH_REGISTRATION_ENABLED: ${AUTH_REGISTRATION_ENABLED:-true}
+      JWT_SECRET: ${JWT_SECRET:-}
+      JWT_ISSUER: ${JWT_ISSUER:-travel-planning-agent}
+      JWT_AUDIENCE: ${JWT_AUDIENCE:-travel-planning-agent-web}
+      JWT_ACCESS_MINUTES: ${JWT_ACCESS_MINUTES:-15}
+      JWT_REFRESH_DAYS: ${JWT_REFRESH_DAYS:-30}
+      BOOTSTRAP_ADMIN_USERNAME: ${BOOTSTRAP_ADMIN_USERNAME:-}
+      BOOTSTRAP_ADMIN_PASSWORD: ${BOOTSTRAP_ADMIN_PASSWORD:-}
     depends_on:
       postgres:
         condition: service_healthy
     volumes:
       - uploads_data:/data/uploads
+      - ${MCP_CONFIG_HOST_PATH:-./config/servers_config.json}:/run/secrets/servers_config.json:ro
     ports:
       - "8000:8000"
 
-  frontend:
-    build: .
-    command: streamlit run app.py --server.address 0.0.0.0 --server.port 8501
-    environment:
-      BACKEND_URL: http://backend:8000
+  # Vue 3 frontend
+  web:
+    build:
+      context: ./frontend-web
+      dockerfile: Dockerfile
     depends_on:
       - backend
     ports:
-      - "8501:8501"
+      - "8080:80"
 
 volumes:
   postgres_data:
